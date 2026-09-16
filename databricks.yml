@@ -196,6 +196,21 @@ variables:
     # production runs never accidentally re-clone already-validated tables.
     description: "Re-onboard tables even if already COMPLETED/VALIDATED (re-test the same CSV/YAML)"
     default: "false"
+  require_target_precreated:
+    # Governance gate for INVENTORY. When "true", a table whose
+    # target_catalog.target_schema.target_table does NOT already exist in
+    # the target workspace is still enlisted into migration_control — but
+    # with status=SKIPPED (error_code=TARGET_NOT_PRECREATED) instead of
+    # QUEUED, so DEEP_CLONE/RETRY (which only ever pick up status='QUEUED')
+    # never touch it. Use this when target tables must be pre-provisioned
+    # (schema/partitioning/grants) by another team before DEEP_CLONE is
+    # allowed to land data. Once the target is created, re-run INVENTORY
+    # with force_reonboard=true to re-check and queue it.
+    # Left "false" by default so DEEP_CLONE keeps auto-creating target
+    # tables via CREATE OR REPLACE ... DEEP CLONE (the original behavior,
+    # used by every prior test in this repo).
+    description: "Skip (don't queue) tables whose target doesn't already exist; require pre-provisioning"
+    default: "false"
 
   # Workspace paths
   orchestrator_notebook:

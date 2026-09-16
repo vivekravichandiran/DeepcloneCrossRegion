@@ -76,6 +76,17 @@ try:
     # docstring). Set to "true" to re-onboard them anyway under a fresh
     # batch_id/run_id (e.g. to re-test the same CSV/YAML end-to-end).
     dbutils.widgets.dropdown("force_reonboard", "false", ["true", "false"])
+    # require_target_precreated: governance gate for INVENTORY. When "true",
+    # a table whose target_catalog.target_schema.target_table does NOT
+    # already exist in the target workspace is enlisted into
+    # migration_control with status=SKIPPED (error_code=TARGET_NOT_PRECREATED)
+    # instead of QUEUED, so DEEP_CLONE/RETRY (which only ever pick up
+    # status='QUEUED') never touch it. Use this when target tables must be
+    # pre-provisioned (schema/partitioning/grants) by another team before
+    # DEEP_CLONE is allowed to land data. Default "false" preserves the
+    # original behavior — DEEP_CLONE auto-creates the target table via
+    # CREATE OR REPLACE ... DEEP CLONE.
+    dbutils.widgets.dropdown("require_target_precreated", "false", ["true", "false"])
 except Exception:
     pass  # widgets already exist or running outside Databricks
 
@@ -266,6 +277,7 @@ _min_executors      = _get_widget("min_executors",         "8")
 # Target schema override (for same-workspace self-clone tests)
 _tgt_schema_override = _get_widget("target_schema", "")
 _force_reonboard = _get_widget("force_reonboard", "false").strip().lower() == "true"
+_require_target_precreated = _get_widget("require_target_precreated", "false").strip().lower() == "true"
 
 log.info("Widget values read directly: mode=%s meta=%s.%s", _wmode, _meta_catalog, _meta_schema)
 
@@ -588,11 +600,23 @@ if MODE in ("INVENTORY", "DRY_RUN"):
             log.info("Reconciled %d stale IN_PROGRESS records", stale)
 
         inv_mgr = InventoryManager(cfg, _disc_sql, tgt_sql, classifier, cfg.run_id)
-        stats   = inv_mgr.run_inventory(selections, force=_force_reonboard)
-        log.info(
-            "Inventory complete: total=%d onboarded=%d skipped=%d failed=%d force_reonboard=%s",
-            stats["total"], stats["inserted"], stats["skipped"], stats["failed"], _force_reonboard
+        stats   = inv_mgr.run_inventory(
+            selections, force=_force_reonboard,
+            require_target_precreated=_require_target_precreated,
         )
+        log.info(
+            "Inventory complete: total=%d onboarded=%d skipped=%d (target_missing=%d) failed=%d "
+            "force_reonboard=%s require_target_precreated=%s",
+            stats["total"], stats["inserted"], stats["skipped"],
+            stats["skipped_target_missing"], stats["failed"],
+            _force_reonboard, _require_target_precreated,
+        )
+        if _require_target_precreated and stats["skipped_target_missing"]:
+            print(
+                f"  ⚠ {stats['skipped_target_missing']} table(s) SKIPPED — target not "
+                f"pre-created (require_target_precreated=true). Pre-create the target "
+                f"table(s) and re-run INVENTORY with force_reonboard=true to queue them."
+            )
         # Audit trail for the global exclusion list (DRY_RUN never writes to
         # migration_* tables — this only fires for real INVENTORY runs).
         if _excluded:

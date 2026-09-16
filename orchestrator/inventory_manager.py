@@ -60,26 +60,48 @@ class InventoryManager:
         self,
         selections: List[TableSelection],
         force:      bool = False,
+        require_target_precreated: bool = False,
     ) -> dict:
         """
         Process a list of TableSelections.
+
+        Args:
+            require_target_precreated: when True, a table whose
+                target_catalog.target_schema.target_table does not already
+                exist in the target workspace is still enlisted into
+                migration_control, but with status=SKIPPED (error_code
+                TARGET_NOT_PRECREATED) instead of QUEUED — it will NOT be
+                picked up by DEEP_CLONE (which only ever selects
+                status='QUEUED'). Governance mode for scenarios where target
+                tables must be pre-provisioned (schema/partitioning/grants)
+                by another team before DEEP_CLONE is allowed to land data.
+                Default False preserves the original behavior (DEEP_CLONE
+                auto-creates the target table via CREATE OR REPLACE ... DEEP
+                CLONE — used by every prior test in this repo).
 
         Returns:
             {
               "total":    int,
               "inserted": int,
-              "skipped":  int,  # already completed
+              "skipped":  int,  # already completed OR target not pre-created
+              "skipped_target_missing": int,  # subset of "skipped" specifically
+                                               # due to require_target_precreated
               "failed":   int,  # source not found or DESCRIBE error
               "records":  List[MigrationRecord]  # newly onboarded
             }
         """
-        stats = {"total": 0, "inserted": 0, "skipped": 0, "failed": 0, "records": []}
+        stats = {
+            "total": 0, "inserted": 0, "skipped": 0,
+            "skipped_target_missing": 0, "failed": 0, "records": [],
+        }
         for sel in selections:
             stats["total"] += 1
             try:
-                rec = self._process_one(sel, force)
+                rec, target_missing = self._process_one(sel, force, require_target_precreated)
                 if rec is None:
                     stats["skipped"] += 1
+                    if target_missing:
+                        stats["skipped_target_missing"] += 1
                 else:
                     stats["inserted"] += 1
                     stats["records"].append(rec)
@@ -91,7 +113,10 @@ class InventoryManager:
 
     # ── Per-table logic ───────────────────────────────────────────────────────
 
-    def _process_one(self, sel: TableSelection, force: bool) -> Optional[MigrationRecord]:
+    def _process_one(
+        self, sel: TableSelection, force: bool, require_target_precreated: bool = False,
+    ) -> "tuple[Optional[MigrationRecord], bool]":
+        """Returns (record_or_None, target_was_missing)."""
         # Check if already in control table
         existing = self._get_existing(sel.source_fqn)
 
@@ -103,14 +128,31 @@ class InventoryManager:
                 MigrationStatus.SKIPPED.value,
             ):
                 log.info("Skipping %s — already %s", sel.source_fqn, existing["status"])
-                return None
+                return None, False
+
+        # ── Governance gate: target must already exist ──────────────────────
+        # Cheap short-circuit BEFORE touching the source at all — if the
+        # target isn't pre-created, there is no point describing the source.
+        if require_target_precreated and not self._target_exists(sel):
+            msg = (
+                f"Target table {sel.target_fqn} does not exist yet in the target "
+                f"catalog. Pre-create it (schema/partitioning/grants) so it can be "
+                f"queued for DEEP_CLONE, or set require_target_precreated=false to "
+                f"let DEEP_CLONE auto-create it."
+            )
+            log.warning(
+                "Target %s not found — marking SKIPPED (require_target_precreated=true)",
+                sel.target_fqn,
+            )
+            self._mark_skipped_target_missing(sel, msg)
+            return None, True
 
         # Validate source existence (UC metadata check via API)
         inv = self._run_describe_detail(sel)
         if inv is None:
             log.warning("Source table %s not found or not Delta — marking FAILED_PERMANENT", sel.source_fqn)
             self._mark_permanent_failure(sel, "Source table not found or not a Delta table")
-            return None
+            return None, False
 
         # Classify workload
         wl_class, wl_weight = self._cls.classify(inv.size_in_bytes)
@@ -155,7 +197,7 @@ class InventoryManager:
             "Onboarded %s → %s [%s %.2f GB w=%d]",
             sel.source_fqn, sel.target_fqn, wl_class, rec.size_gb, wl_weight
         )
-        return rec
+        return rec, False
 
     # ── DESCRIBE DETAIL ───────────────────────────────────────────────────────
 
@@ -206,6 +248,99 @@ class InventoryManager:
         except Exception:
             pass
         return None
+
+    # ── Target pre-existence gate (require_target_precreated) ──────────────────
+
+    def _target_exists(self, sel: TableSelection) -> bool:
+        """
+        True iff target_catalog.target_schema.target_table already exists in
+        the target workspace. Uses a lightweight DESCRIBE TABLE (no size
+        stats needed — this is purely an existence probe) against tgt_sql.
+
+        Any *_NOT_FOUND error (table, schema, or catalog missing) is treated
+        as "doesn't exist yet". Any other error (e.g. a permission problem)
+        is NOT swallowed — it propagates so it surfaces as a real inventory
+        failure instead of being silently misclassified as "missing".
+        """
+        fqn = f"`{sel.target_catalog}`.`{sel.target_schema}`.`{sel.target_table}`"
+        try:
+            self._tgt.execute(f"DESCRIBE TABLE {fqn}")
+            return True
+        except RuntimeError as e:
+            err = str(e)
+            if any(code in err for code in (
+                "TABLE_OR_VIEW_NOT_FOUND", "SCHEMA_NOT_FOUND", "CATALOG_NOT_FOUND",
+            )):
+                return False
+            raise
+
+    def _mark_skipped_target_missing(self, sel: TableSelection, msg: str) -> None:
+        """
+        Enlist sel into migration_control with status=SKIPPED (terminal,
+        never picked up by DEEP_CLONE/RETRY — both only ever select
+        status='QUEUED') and error_code=TARGET_NOT_PRECREATED, instead of
+        the generic FAILED_PERMANENT used by _mark_permanent_failure().
+
+        Modeled closely on _mark_permanent_failure()'s MERGE — same minimal
+        column set (no source DESCRIBE DETAIL was run, since the whole point
+        of checking the target FIRST is to avoid that round-trip when we're
+        going to skip anyway).
+        """
+        now = _TS()
+        msg_esc = msg.replace("'", "\\'")[:500]
+        mid = str(uuid.uuid4())
+        batch_id_val = (getattr(self._cfg, "batch_id", "") or "").replace("'", "\\'")
+        try:
+            q = f"""
+            MERGE INTO {self._ctrl} AS t
+            USING (SELECT '{sel.source_catalog}' AS sc, '{sel.source_schema}' AS ss,
+                          '{sel.source_table}' AS st) AS s
+            ON t.source_catalog = s.sc AND t.source_schema = s.ss AND t.source_table = s.st
+            WHEN MATCHED THEN UPDATE SET
+              status = 'SKIPPED', error_code = 'TARGET_NOT_PRECREATED',
+              error_message = '{msg_esc}', batch_id = '{batch_id_val}',
+              -- Refresh the target mapping too — the row may pre-date this
+              -- CSV/YAML's current target mapping (e.g. an earlier batch
+              -- pointed this same source table at a different target).
+              -- Without this, the persisted row would show a stale/unrelated
+              -- target_catalog/schema/table while error_message (built fresh
+              -- from sel.target_fqn) correctly names the CURRENT target —
+              -- a misleading mismatch for anyone auditing this row.
+              target_catalog   = '{sel.target_catalog}',
+              target_schema    = '{sel.target_schema}',
+              target_table     = '{sel.target_table}',
+              -- Same rationale as _upsert()'s reset-on-reonboard block: if
+              -- this source table was previously COMPLETED/VALIDATED against
+              -- a DIFFERENT target (e.g. an earlier batch/CSV mapping), those
+              -- stale validation_status='VALIDATED'/row-count/timestamp
+              -- values must NOT survive onto this SKIPPED row — otherwise a
+              -- table that was never cloned under THIS mapping would
+              -- misleadingly show as already validated.
+              validation_status = NULL,
+              source_row_count  = NULL,
+              target_row_count  = NULL,
+              started_at        = NULL,
+              completed_at      = NULL,
+              failed_at         = NULL,
+              updated_at = TIMESTAMP '{now}'
+            WHEN NOT MATCHED THEN INSERT (
+              migration_id, run_id, clone_type, source_workspace, target_workspace,
+              source_catalog, source_schema, source_table,
+              target_catalog, target_schema, target_table,
+              status, error_code, error_message, batch_id,
+              discovered_at, created_at, updated_at
+            ) VALUES (
+              '{mid}', '{self._run_id}', '{self._cfg.clone_type}',
+              '{self._cfg.source_workspace_url}', '{self._cfg.target_workspace_url}',
+              '{sel.source_catalog}', '{sel.source_schema}', '{sel.source_table}',
+              '{sel.target_catalog}', '{sel.target_schema}', '{sel.target_table}',
+              'SKIPPED', 'TARGET_NOT_PRECREATED', '{msg_esc}', '{batch_id_val}',
+              TIMESTAMP '{now}', TIMESTAMP '{now}', TIMESTAMP '{now}'
+            )
+            """
+            self._tgt.execute_ddl(q)
+        except Exception as e:
+            log.error("Could not record SKIPPED (target missing) for %s: %s", sel.source_fqn, e)
 
     # ── Control table operations ──────────────────────────────────────────────
 

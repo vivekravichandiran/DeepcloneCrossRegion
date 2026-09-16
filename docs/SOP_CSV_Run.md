@@ -1,7 +1,7 @@
 # DeepClone CrossRegion — SOP: Running a CSV-based Migration (`input_type = CSV`, `clone_type = delta_share`)
 
 **Document ID:** SOP-DCR-CSV-01
-**Version:** 1.4
+**Version:** 1.5
 **Owner:** Data Platform Engineering
 **Applies to bundle:** `deepclone_orchestrator` (`databricks.yml`)
 **Classification:** Internal — Data Engineering
@@ -197,6 +197,27 @@ Matching is case-insensitive glob (`fnmatch`), same semantics as Format B's `exc
 
 Leave `exclusion_csv_path` blank (the widget/job-parameter default) for zero exclusions / zero behavior change.
 
+### Optional — Governance gate: `require_target_precreated`
+
+By default, DEEP_CLONE auto-creates the target table (`CREATE TABLE ... DEEP CLONE ...`)
+if it doesn't already exist. Some environments require the target table/schema to be
+provisioned out-of-band first (correct storage location, grants, tags, partitioning)
+**before** any data is allowed to land in it. Set the job/bundle parameter
+`require_target_precreated: "true"` to enforce this: at INVENTORY, before touching the
+source at all, each row's target is probed with a lightweight `DESCRIBE TABLE`. If the
+target doesn't exist yet, the row is onboarded as `status=SKIPPED`,
+`error_code=TARGET_NOT_PRECREATED` (not `QUEUED`) — and since DEEP_CLONE/RETRY only ever
+select `status='QUEUED'` rows, a skipped row can **never** be auto-created downstream.
+
+**Recovery:** once the target is pre-created out-of-band, re-run INVENTORY with
+`force_reonboard=true` (gate still `true`) — the row is re-evaluated, the target is
+found, and it flips `SKIPPED → QUEUED`, ready for the next DEEP_CLONE run.
+
+Leave `require_target_precreated` at its default (`"false"`) for the standard
+auto-create behavior — this flag is fully opt-in and does not change any existing
+pipeline. Full test matrix and results:
+[`Test_Report_Target_Precreated_Gate.md`](Test_Report_Target_Precreated_Gate.md).
+
 ---
 
 ## Step 2 — Point `databricks.yml` at your CSV
@@ -213,6 +234,8 @@ variables:
     default: "CSV"     # optional / cosmetic — see note below
   exclusion_csv_path:
     default: "${workspace.file_path}/configs/<your_exclusion_file>.csv"   # optional — blank = no exclusions
+  require_target_precreated:
+    default: "false"   # optional — set "true" to skip (not auto-create) tables whose target doesn't exist yet
 ```
 
 ![databricks.yml — clone_type: delta_share](sop_images/01_databricks_yml_clone_type_delta_share.png)
@@ -533,6 +556,7 @@ ORDER BY excluded_at DESC;
 
 | Version | Date | Author | Change |
 |---|---|---|---|
+| 1.5 | 2026-09-16 | Data Platform Engineering | Added the **`require_target_precreated` governance gate** (`orchestrator/inventory_manager.py::_target_exists()` / `_mark_skipped_target_missing()`) — an opt-in job/bundle parameter that makes INVENTORY skip (not auto-create) any table whose target doesn't already exist, marking it `status=SKIPPED`/`error_code=TARGET_NOT_PRECREATED` so DEEP_CLONE/RETRY (which only select `status='QUEUED'`) can never touch it. Recovery path: pre-create the target out-of-band, then re-run INVENTORY with `force_reonboard=true` to flip it back to `QUEUED`. Documented in Step 1 ("Optional — Governance gate") and Step 2 (`databricks.yml` wiring). Fixed two bugs found during testing: `_mark_skipped_target_missing()`'s MERGE wasn't refreshing `target_catalog`/`target_schema`/`target_table` or resetting `validation_status`/row-counts/timestamps on re-skip, leaving misleading stale data on SKIPPED rows. Verified with a 6-case test matrix (unit test + standalone INVENTORY/DEEP_CLONE + recovery + full end-to-end `06_full_migration_workflow` run) — full results in [`Test_Report_Target_Precreated_Gate.md`](Test_Report_Target_Precreated_Gate.md). |
 | 1.4 | 2026-09-10 | Data Platform Engineering | **Removed all external secrets.** Deleted the `deepclone-migration` Databricks Secret scope and every `client_id`/`client_secret`/`{{secrets/...}}` reference from `orchestrator/sql_client.py`, `orchestrator/api_client.py`, `orchestrator/config.py`, `notebooks/setup_control_tables.py`, and every `resources/*.yml` job cluster / `worker_cluster_json` spec. `SqlClient`/`ApiClient` now authenticate natively via `databricks.sdk.core.Config()` (Databricks unified/runtime auth — automatic inside any job/notebook, nothing to provision or rotate). The only workspace-connection values left are the plain, non-secret `target_warehouse_id` / `source_warehouse_id` bundle variables (SQL warehouse IDs, not credentials) — wired as job parameters on every job (`00`–`06`). Also fixed a latent bug this change surfaced: `03_deep_clone_job.yml`/`05_retry_job.yml` hard-coded/omitted `clone_type`, which only "worked" before because of leftover non-blank dummy secret values satisfying the old (weak) validation check — both now read `clone_type` from `${var.clone_type}` like every other job. Deleted the fully-superseded, secret-dependent `scripts/deploy_to_workspace.py` and `tests/generate_report.py` (pre-bundle, already marked stale/unused). Verified end-to-end **with the secret scope deleted**: ran INVENTORY → DEEP_CLONE → VALIDATE against a fresh batch (`no-secrets-test-*`, 7 tables) on `ril_bulk_csvtest` → `ril_tgt_02` — all 7 `VALIDATED` with matching row counts, zero auth errors. |
 | 1.3 | 2026-09-09 | Data Platform Engineering | Added the **global exclusion list** feature (`exclusion_csv_path`, `orchestrator/exclusion_manager.py`) — a separate CSV of `catalog`/`schema`/`table` exclusion rules, applied at INVENTORY on top of any `input_type`, independent of Format B's per-row `exclude_schemas`/`exclude_tables`. Excluded tables never reach `migration_control`; they're recorded to the new `migration_exclusion_log` audit table instead. Documented in Step 1 ("Optional — Global exclusion list"), Step 2 (`databricks.yml` wiring), Step 5/6/10 (verification + sign-off queries), §17 (cheat-sheet query), and a new Gotcha G8. Also noted the current scale-test default `csv_path` → `configs/csv_scale_ril_bulk_02_full.csv` (whole-catalog `ril_bulk_02` → `ril_tgt_02`, 130 tables, verified with 8 parallel chunk clusters) in Step 1's tip. Verified end-to-end: INVENTORY with `exclusion_csv_path` set to exclude the whole `iot` schema (26 tables) + `finance.dim_finance_01` (1 table) from the 130-table scale CSV onboarded exactly 103 and logged exactly 27 exclusions, zero leakage into `migration_control`. |
 | 1.2 | 2026-09-09 | Data Platform Engineering | Added §3.1 — mandatory pre-flight check that `source_catalog`/`source_schema`/`source_table` are already Delta Shared and mounted (or same-metastore visible) from the **target** workspace before Step 1, with the source-side (`CREATE SHARE`/`ADD SCHEMA`/`CREATE RECIPIENT`/`GRANT`) and target-side (`CREATE CATALOG ... USING SHARE`) setup commands for a true cross-metastore migration, plus a verification query (`SHOW SCHEMAS`/`SHOW TABLES`/`DESCRIBE DETAIL`). Cross-referenced from G2 as the #1 real-world cause of "0 tables resolved". |

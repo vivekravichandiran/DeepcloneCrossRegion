@@ -78,6 +78,14 @@ resources:
         # to re-exercise the same table list end-to-end for a repeat test.
         - name: force_reonboard
           default: "${var.force_reonboard}"
+        # require_target_precreated: governance gate. When "true", a table
+        # whose target_catalog.target_schema.target_table does not already
+        # exist in the target workspace is enlisted into migration_control
+        # as SKIPPED (error_code=TARGET_NOT_PRECREATED) instead of QUEUED,
+        # so DEEP_CLONE/RETRY never touch it. Default "false" preserves the
+        # original behavior (DEEP_CLONE auto-creates the target table).
+        - name: require_target_precreated
+          default: "${var.require_target_precreated}"
 
       tasks:
         - task_key: inventory
@@ -103,6 +111,7 @@ resources:
               parallel_threads: "{{job.parameters.parallel_threads}}"
               min_executors: "{{job.parameters.min_executors}}"
               force_reonboard: "{{job.parameters.force_reonboard}}"
+              require_target_precreated: "{{job.parameters.require_target_precreated}}"
               target_warehouse_id: "{{job.parameters.target_warehouse_id}}"
               source_warehouse_id: "{{job.parameters.source_warehouse_id}}"
           job_cluster_key: orchestrator_cluster

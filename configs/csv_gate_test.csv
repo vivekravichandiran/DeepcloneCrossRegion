@@ -1,0 +1,5 @@
+clone_type,source_catalog,source_schema,source_table,target_catalog,target_schema,target_table,exclude_schemas,exclude_tables
+table,ril_bulk_csvtest,finance,dim_finance_01,ril_tgt_gate_test,finance,dim_finance_01_gate,,
+table,ril_bulk_csvtest,finance,dim_finance_02,ril_tgt_gate_test,finance,dim_finance_02_gate,,
+table,ril_bulk_csvtest,hr,dim_hr_01,ril_tgt_gate_test,hr,dim_hr_01_gate,,
+table,ril_bulk_csvtest,hr,dim_hr_02,ril_tgt_gate_test,hr,dim_hr_02_gate,,

@@ -79,6 +79,12 @@ resources:
         # batch_id/run_id (e.g. to re-exercise a repeat end-to-end test).
         - name: force_reonboard
           default: "${var.force_reonboard}"
+        # require_target_precreated: governance gate — see the matching
+        # comment in resources/01_inventory_job.yml. Default "false"
+        # preserves the original behavior (DEEP_CLONE auto-creates the
+        # target table).
+        - name: require_target_precreated
+          default: "${var.require_target_precreated}"
         # target_warehouse_id / source_warehouse_id: plain (non-secret) SQL
         # warehouse identifiers — NOT credentials. No client_id/client_secret/
         # secret-scope anywhere: SqlClient/ApiClient authenticate natively via
@@ -117,6 +123,7 @@ resources:
               parallel_threads: "{{job.parameters.parallel_threads}}"
               min_executors: "{{job.parameters.min_executors}}"
               force_reonboard: "{{job.parameters.force_reonboard}}"
+              require_target_precreated: "{{job.parameters.require_target_precreated}}"
               target_warehouse_id: "{{job.parameters.target_warehouse_id}}"
               source_warehouse_id: "{{job.parameters.source_warehouse_id}}"
           job_cluster_key: orchestrator_cluster

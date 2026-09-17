@@ -16,16 +16,14 @@ resources:
           default: ${var.max_retries}
         - name: worker_spark_version
           default: ${var.worker_spark_version}
-        - name: worker_node_type
-          default: ${var.worker_node_type}
         - name: batch_id
           default: ""    # retry only this batch; blank = retry ALL
         - name: max_concurrent_chunks
-          default: "3"
+          default: ${var.max_concurrent_chunks}
         - name: parallel_threads
           default: "4"
         - name: min_executors
-          default: "2"
+          default: ${var.min_executors}
         - name: worker_notebook_path
           default: ${var.worker_notebook}   # deployed path to chunk_worker_notebook
         # target_warehouse_id / source_warehouse_id: plain (non-secret) SQL
@@ -64,11 +62,14 @@ resources:
               # No spark_env_vars needed — chunk_worker_notebook.py runs DEEP
               # CLONE directly via Spark on its own cluster and never calls
               # SqlClient/ApiClient, so it has no auth/secrets dependency.
+              # Provisioned on-demand (NOT via the shared control-plane
+              # instance_pool_id — see resources/03_deep_clone_job.yml).
               worker_cluster_json: >
                 {
                   "spark_version": "${var.worker_spark_version}",
-                  "instance_pool_id": "${var.instance_pool_id}",
-                  "num_workers": 2,
+                  "node_type_id": "${var.worker_node_type}",
+                  "azure_attributes": {"availability": "ON_DEMAND_AZURE"},
+                  "num_workers": ${var.worker_num_workers},
                   "data_security_mode": "DATA_SECURITY_MODE_AUTO"
                 }
           job_cluster_key: orchestrator_cluster

@@ -55,11 +55,11 @@ resources:
         - name: chunk_capacity_gb
           default: "50"        # GB soft-limit per chunk / cluster
         - name: max_concurrent_chunks
-          default: "3"         # max parallel clusters per batch
+          default: ${var.max_concurrent_chunks}   # max parallel clusters per batch
         - name: parallel_threads
           default: "4"         # clone threads within each cluster
         - name: min_executors
-          default: "2"         # worker nodes per chunk cluster
+          default: ${var.min_executors}   # worker nodes (executors) per chunk cluster
         # target_warehouse_id / source_warehouse_id: plain (non-secret) SQL
         # warehouse identifiers — NOT credentials. No client_id/client_secret/
         # secret-scope anywhere: SqlClient/ApiClient authenticate natively via

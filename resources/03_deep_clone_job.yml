@@ -20,20 +20,18 @@ resources:
           default: ${var.max_retries}
         - name: worker_spark_version
           default: ${var.worker_spark_version}
-        - name: worker_node_type
-          default: ${var.worker_node_type}
         # ── Batch / Chunk parameters ──────────────────────────────────────────
         # batch_id MUST match the value used during INVENTORY for the same scope
         - name: batch_id
           default: ""           # required: pass same batch_id used in INVENTORY
         - name: max_concurrent_chunks
-          default: "3"          # max cluster jobs running in parallel per batch
+          default: ${var.max_concurrent_chunks}   # max cluster jobs running in parallel per batch
         - name: parallel_threads
           default: "4"          # clone threads per chunk cluster (concurrent tables)
         - name: chunk_capacity_gb
           default: "50"         # GB cap per chunk (should match INVENTORY setting)
         - name: min_executors
-          default: "2"          # minimum Spark worker nodes per chunk cluster
+          default: ${var.min_executors}   # minimum Spark worker nodes (executors) per chunk cluster
         - name: worker_notebook_path
           default: ${var.worker_notebook}   # deployed path to chunk_worker_notebook
         # target_warehouse_id / source_warehouse_id: plain (non-secret) SQL
@@ -74,16 +72,20 @@ resources:
               worker_notebook_path: "{{job.parameters.worker_notebook_path}}"
               target_warehouse_id: "{{job.parameters.target_warehouse_id}}"
               source_warehouse_id: "{{job.parameters.source_warehouse_id}}"
-              # Chunk worker cluster spec — num_workers enforced to >= min_executors
-              # at runtime. No spark_env_vars needed — chunk_worker_notebook.py
-              # runs DEEP CLONE directly via Spark on its own cluster and never
-              # calls SqlClient/ApiClient, so it has no auth/secrets dependency
+              # Chunk worker cluster spec — provisioned on-demand (NOT via the
+              # shared control-plane instance_pool_id — that pool is pinned to
+              # a fixed, smaller VM type). num_workers enforced to >=
+              # min_executors at runtime (see orchestrator_notebook.py).
+              # No spark_env_vars needed — chunk_worker_notebook.py runs DEEP
+              # CLONE directly via Spark on its own cluster and never calls
+              # SqlClient/ApiClient, so it has no auth/secrets dependency
               # at all.
               worker_cluster_json: >
                 {
                   "spark_version": "${var.worker_spark_version}",
-                  "instance_pool_id": "${var.instance_pool_id}",
-                  "num_workers": 2,
+                  "node_type_id": "${var.worker_node_type}",
+                  "azure_attributes": {"availability": "ON_DEMAND_AZURE"},
+                  "num_workers": ${var.worker_num_workers},
                   "data_security_mode": "DATA_SECURITY_MODE_AUTO",
                   "spark_conf": {"spark.databricks.delta.preview.enabled": "true"}
                 }

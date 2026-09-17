@@ -99,24 +99,32 @@ variables:
     default: "17.3.x-scala2.13"   # 17.3 LTS (Apache Spark 4.0.0, Scala 2.13)
 
   # ── Chunk worker cluster — one ephemeral cluster per chunk ────────────────────
-  # Standard_D4s_v3: 4 vCPUs, 16 GB RAM per node — lightweight, widely available.
+  # Standard_E32ds_v5: 32 vCPUs, 256 GB RAM per node — memory-optimized, sized
+  # for larger/heavier DEEP CLONE chunks. Provisioned on-demand directly (NOT
+  # via instance_pool_id — the shared pool below is pinned to Standard_D4s_v3
+  # and used only for the lightweight orchestrator control-plane clusters).
   worker_node_type:
     description: "Azure VM type for chunk worker clusters"
-    default: Standard_D4s_v3    # 4 vCPU / 16 GB per node — widely available, avoids E32ds_v5 capacity stockouts
+    default: Standard_E32ds_v5
   setup_node_type:
     description: "Azure VM type for the lightweight control-table setup job (small & widely available)"
     default: Standard_D4s_v3    # 4 vCPU / 16 GB — plenty for DDL-only setup
   worker_num_workers:
-    description: "Number of Spark worker nodes per chunk cluster"
-    default: "4"                  # → 4 executor nodes + 1 driver = 5 nodes total (scale test: 8 clusters × 5 = 40 nodes)
+    description: "Number of Spark worker nodes (executors) per chunk cluster"
+    default: "8"                  # → 8 executor nodes + 1 driver = 9 nodes per chunk cluster
 
-  # ── Instance pool — used for ALL job_clusters (orchestrator control-plane
-  # clusters) so debugging/iterative test runs start in seconds instead of
-  # minutes (idle pool instances are reused instead of provisioning fresh
-  # on-demand VMs). Node type / provisioning strategy is fixed by the pool
-  # itself, so node_type_id / azure_attributes are omitted wherever this is used.
+  # ── Instance pool — used ONLY for the lightweight orchestrator control-plane
+  # job_clusters (2-node, always-on for the life of the job) so debugging/
+  # iterative test runs start in seconds instead of minutes (idle pool
+  # instances are reused instead of provisioning fresh on-demand VMs). The
+  # pool is pinned to Standard_D4s_v3 — node type / provisioning strategy is
+  # fixed by the pool itself wherever instance_pool_id is used.
+  # Ephemeral CHUNK WORKER clusters (worker_cluster_json, one per DEEP_CLONE/
+  # RETRY chunk) do NOT use this pool — they provision on-demand directly
+  # with node_type_id: ${var.worker_node_type} instead, since chunk sizing
+  # (VM type / worker count) is independent of the control-plane pool.
   instance_pool_id:
-    description: "Instance pool ID for orchestrator job_clusters (fast start for debugging/dev iteration)"
+    description: "Instance pool ID for the orchestrator control-plane job_clusters only (fast start for debugging/dev iteration)"
     default: "0908-093007-hoped4-pool-q4mi8hia"
 
   # ── SQL warehouse IDs — plain, non-secret identifiers (NOT credentials) ──────
@@ -136,7 +144,7 @@ variables:
     default: ""                   # blank = auto-generated (date + UUID) at runtime
   max_concurrent_chunks:
     description: "Max cluster jobs (chunks) running simultaneously PER BATCH. Controls cluster spend."
-    default: "8"                  # scale test: 8 × 5-node clusters = 40 nodes live at once per batch
+    default: "5"                  # 5 × 9-node (1 driver + 8 executor) E32ds_v5 clusters live at once per batch
   parallel_threads:
     description: "Clone threads inside each chunk cluster. Each thread = one concurrent DEEP CLONE."
     default: "4"                  # 4 tables copying simultaneously on each chunk cluster
@@ -144,8 +152,8 @@ variables:
     description: "Soft GB cap per chunk. Tables are bin-packed until this limit OR max_tables_per_chunk (auto-derived as ceil(n_tables/max_concurrent_chunks) in orchestrator_notebook.py) is hit — the count cap guarantees real chunk/cluster parallelism even when the table set is small in total GB (e.g. many tiny tables)."
     default: "500"                 # 500 GB per chunk; tune based on cluster memory
   min_executors:
-    description: "Minimum Spark worker nodes enforced per chunk cluster (overrides worker_num_workers if lower)"
-    default: "4"                  # aligned with worker_num_workers = 4
+    description: "Minimum Spark worker nodes enforced per chunk cluster (overrides worker_num_workers if lower — see notebooks/orchestrator_notebook.py's num_workers-floor logic)"
+    default: "8"                  # aligned with worker_num_workers = 8
 
   # ── Table-selection input source (INVENTORY job) ─────────────────────────────
   # Set input_type to CSV, YAML, or JOB here to control the migration source

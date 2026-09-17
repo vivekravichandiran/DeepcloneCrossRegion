@@ -45,15 +45,15 @@ All test cases below were executed on live Databricks jobs in the `ril_catalog_t
 |---|---|---|
 | A — Input Resolution & Configuration | 5 | ✅ All PASS |
 | B — Cluster / Infrastructure | 3 | ✅ All PASS |
-| C — Batch & Retry Mechanics | 3 | ✅ All PASS |
+| C — Batch & Retry Mechanics | 4 | ✅ All PASS |
 | D — INVENTORY Phase | 2 | ✅ All PASS |
 | E — DEEP_CLONE Phase | 2 | ✅ All PASS |
 | F — VALIDATE Phase & Change Propagation | 2 | ✅ All PASS |
 | G — Security | 1 | ✅ PASS |
 | H — `require_target_precreated` Gate | 6 | ✅ All PASS |
-| **Total** | **24** | **✅ 24/24 PASS** |
+| **Total** | **25** | **✅ 25/25 PASS** |
 
-Two defects were found and fixed during testing (§11); both were re-tested and confirmed fixed.
+Seventeen defects were found and fixed during testing (§11); all were re-tested and confirmed fixed.
 
 ---
 
@@ -196,15 +196,55 @@ Two defects were found and fixed during testing (§11); both were re-tested and 
 
 ---
 
-### TC-C2 — `force_reonboard` correctly resets stale fields
+### TC-C2 — `force_reonboard` correctly resets stale fields (within the same batch)
 
-**Objective:** Confirm that re-running INVENTORY with `force_reonboard=true` against an already `COMPLETED`/`VALIDATED` table re-processes it and clears stale `validation_status`, row counts, and error fields rather than leaving misleading old data.
+**Objective:** Confirm that re-running INVENTORY with `force_reonboard=true` against an already `COMPLETED`/`VALIDATED` table, **under the same `batch_id`**, re-processes it and clears stale `validation_status`, row counts, and error fields rather than leaving misleading old data — updating that batch's own row in place (same `migration_id`), not creating a duplicate.
 
-**Steps:** Onboard + fully validate a table; modify its target mapping (e.g. via a new CSV); re-run INVENTORY with `force_reonboard=true`.
+**Steps:** Onboard + fully validate a table under `batch_id=B`; modify its target mapping (e.g. via a new CSV) or simply re-run; re-run INVENTORY with `batch_id=B`, `force_reonboard=true`.
 
-**Expected Result:** The row's `validation_status`, `source_row_count`, `target_row_count`, `started_at`/`completed_at`/`failed_at`, and error fields are reset to `NULL`/fresh on re-onboard; it becomes `QUEUED` again under the new mapping.
+**Expected Result:** The row's `validation_status`, `source_row_count`, `target_row_count`, `started_at`/`completed_at`/`failed_at`, and error fields are reset to `NULL`/fresh on re-onboard, **same `migration_id`**; it becomes `QUEUED` again under the new mapping.
 
-**Actual Result:** Found and fixed a bug where `_upsert()`'s `MERGE ... WHEN MATCHED` didn't reset these fields, leaving `STALE_EXECUTION`-looking rows. Fixed by explicitly nulling them in the `UPDATE SET` clause. Re-verified via the update/insert change-propagation test (§8, TC-F2) — `force_reonboard=true` correctly re-validated all 7 tables with fresh, updated row counts.
+**Actual Result:** Found and fixed a bug where `_upsert()`'s `MERGE ... WHEN MATCHED` didn't reset these fields, leaving `STALE_EXECUTION`-looking rows. Fixed by explicitly nulling them in the `UPDATE SET` clause. Re-verified via the update/insert change-propagation test (§8, TC-F2) — `force_reonboard=true` correctly re-validated all 7 tables with fresh, updated row counts. Re-verified again post-TC-C4 fix (below): `force_reonboard=true` on batch `mb-batch-1` reset its row to `QUEUED` with the **same** `migration_id` (`ad68cb55…`), then successfully re-cloned/re-validated — confirming same-batch idempotent reset still works after `migration_control`'s identity key changed to include `batch_id`.
+
+**Note:** `force_reonboard` is scoped to the **current `batch_id` only** — see TC-C4. A genuinely different/new `batch_id` for the same source table is never blocked by the terminal-status skip check to begin with (see TC-C4), so it doesn't need `force_reonboard` to get a fresh row.
+
+**Status:** ✅ PASS (after fix — see §11)
+
+---
+
+### TC-C4 — PRIORITY: Same source table under multiple different `batch_id`s → separate, independent rows (no history loss)
+
+**Objective:** Confirm `migration_control`'s identity key is `(source_catalog, source_schema, source_table, batch_id)`, not just the source table — i.e. running the SAME table through DEEP_CLONE under a NEW `batch_id` creates a **brand-new row**, leaving every earlier batch's row for that table completely untouched (full per-batch history preserved), while re-running the SAME `batch_id` remains idempotent (updates its own row, no duplicate).
+
+**Preconditions:** 2 source tables (`ril_bulk_csvtest.finance.dim_finance_01`, `ril_bulk_csvtest.hr.dim_hr_01`) that already had one pre-existing row each from an unrelated batch (`tc2-gate-on-mixed`, `COMPLETED`) — used as an extra "must stay untouched" control throughout.
+
+**Steps:**
+1. INVENTORY → DEEP_CLONE → VALIDATE for `batch_id=mb-batch-1` (both tables).
+2. Re-run INVENTORY for `batch_id=mb-batch-1` again, no `force_reonboard` → confirm idempotent (no duplicate, no change).
+3. INVENTORY → DEEP_CLONE → VALIDATE for `batch_id=mb-batch-2` (same 2 tables, same CSV).
+4. INVENTORY → DEEP_CLONE → VALIDATE for `batch_id=mb-batch-3` (same 2 tables, same CSV) — run concurrently with step 5 as a bonus concurrency check.
+5. `force_reonboard=true` on `mb-batch-1` (already `VALIDATED`) → confirm same-batch reset (same `migration_id`) → re-clone → re-validate.
+6. Run `06_full_migration_workflow` end-to-end for `batch_id=mb-batch-fullworkflow` (5th batch, same 2 tables, `require_target_precreated=true`).
+7. After every step, re-check `tc2-gate-on-mixed`'s original row is byte-for-byte unchanged.
+
+**Expected Result:** After all steps, exactly **5 independent rows per source table** (`tc2-gate-on-mixed`, `mb-batch-1`, `mb-batch-2`, `mb-batch-3`, `mb-batch-fullworkflow`), each with its own `migration_id`, each correctly `VALIDATED` (except the untouched control, still `COMPLETED`) with matching row counts. No step ever creates a 6th/duplicate row for a batch that already has one for that table.
+
+**Actual Result:** Confirmed exactly as expected — live query at the end of testing:
+
+| batch_id | migration_id | source_table | status | validation_status | rows |
+|---|---|---|---|---|---|
+| mb-batch-1 | `ad68cb55…` | dim_finance_01 | VALIDATED | VALIDATED | 52/52 |
+| mb-batch-2 | `7d72ba21…` | dim_finance_01 | VALIDATED | VALIDATED | 52/52 |
+| mb-batch-3 | `0b4815f5…` | dim_finance_01 | VALIDATED | VALIDATED | 52/52 |
+| mb-batch-fullworkflow | `b6c28bbc…` | dim_finance_01 | VALIDATED | VALIDATED | 52/52 |
+| tc2-gate-on-mixed | `0cdd60e9…` | dim_finance_01 | COMPLETED (**unchanged**) | None | — |
+| mb-batch-1 | `258a69ef…` | dim_hr_01 | VALIDATED | VALIDATED | 63/63 |
+| mb-batch-2 | `038f2477…` | dim_hr_01 | VALIDATED | VALIDATED | 63/63 |
+| mb-batch-3 | `a96edd38…` | dim_hr_01 | VALIDATED | VALIDATED | 63/63 |
+| mb-batch-fullworkflow | `81ad74d7…` | dim_hr_01 | VALIDATED | VALIDATED | 63/63 |
+| tc2-gate-on-mixed | `6be6d861…` | dim_hr_01 | COMPLETED (**unchanged**) | None | — |
+
+**10 fully independent rows across the 2 source tables.** `migration_attempts` (append-only) confirms `mb-batch-1`'s row has exactly 2 attempt rows (initial clone + the `force_reonboard` re-clone in step 5, on 2 different ephemeral clusters), while `mb-batch-2`/`mb-batch-3`/`mb-batch-fullworkflow` each have exactly 1 — proving attempt-level history is also correctly, unambiguously attributable per batch. Full detail, including the companion `require_target_precreated`-gate and `FAILED_PERMANENT` regression tests run across multiple batches, in [`Test_Report_MultiBatch_History.md`](Test_Report_MultiBatch_History.md).
 
 **Status:** ✅ PASS (after fix — see §11)
 
@@ -468,8 +508,10 @@ Two defects were found and fixed during testing (§11); both were re-tested and 
 | 13 | Chunk clusters created in non-Unity-Catalog mode in client environments | TC-B2 | Added `data_security_mode: DATA_SECURITY_MODE_AUTO` to every cluster spec + defensive runtime fallback |
 | 14 | `_mark_skipped_target_missing()` didn't refresh `target_catalog`/`schema`/`table` on re-skip (stale mapping shown) | TC-H2/H4 | Explicitly set these columns in the `UPDATE SET` clause |
 | 15 | `_mark_skipped_target_missing()` didn't reset `validation_status`/row counts/timestamps on re-skip (stale validation data shown on a `SKIPPED` row) | TC-H2/H4 | Explicitly nulled these columns in the same `UPDATE SET` clause |
+| 16 | `migration_control`'s identity key was `(source_catalog, source_schema, source_table)` only — the SAME table onboarded under a NEW `batch_id` silently found and overwrote the PREVIOUS batch's row (`_get_existing()`/`_upsert()`), losing that batch's `batch_id`, timestamps, and row counts — full cross-batch history was lost | TC-C4 | Changed identity key to `(source_catalog, source_schema, source_table, batch_id)` in `_get_existing()` (added `batch_id` filter) and `_upsert()`'s `MERGE` (natural-key match instead of bare `migration_id`). Every `batch_id` now gets its own row; same-batch re-runs remain idempotent |
+| 17 | `_mark_permanent_failure()` had the same `(source_catalog, source_schema, source_table)`-only match key AND never wrote `batch_id` to the row at all (FAILED_PERMANENT rows always had a blank `batch_id`) | TC-C4 (TC-MB-PERM) | Added `batch_id` to the `MERGE` match key and to both the `UPDATE` and `INSERT` value lists |
 
-All 15 defects were re-tested after their fix and confirmed resolved as part of the test cases cited in the "Found In" column.
+All 17 defects were re-tested after their fix and confirmed resolved as part of the test cases cited in the "Found In" column. Defects 16–17 additionally required regenerating/deploying the bundle and a dedicated live multi-batch regression pass — see [`Test_Report_MultiBatch_History.md`](Test_Report_MultiBatch_History.md) for full detail (14 individual assertions across 6 test groups, all PASS).
 
 ---
 

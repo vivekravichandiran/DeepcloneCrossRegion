@@ -35,8 +35,22 @@ class InventoryManager:
     """
     Idempotent inventory: upserts migration_control records.
 
-    An existing COMPLETED or VALIDATED record is not re-onboarded unless
-    `force=True` is passed to `run_inventory`.
+    Identity key = (source_catalog, source_schema, source_table, batch_id).
+    batch_id is a first-class part of that key — NOT just a descriptive
+    column — so every batch_id gets its OWN row per source table:
+      - Re-running INVENTORY again for the SAME batch_id is idempotent
+        (finds and updates that batch's own row; no duplicates).
+      - Onboarding the SAME source table under a DIFFERENT/new batch_id
+        always creates a brand-new row, leaving every earlier batch's row
+        for that table completely untouched — full per-batch history is
+        preserved in migration_control itself, not just in the separate
+        immutable migration_attempts/migration_validation_history tables.
+
+    Consequently, `force=True` (force_reonboard) is scoped to the CURRENT
+    batch_id only: an existing COMPLETED/VALIDATED/FAILED_PERMANENT/SKIPPED
+    row for THIS SAME batch_id is not re-onboarded unless `force=True`. A
+    genuinely different batch_id is never blocked by this check at all — it
+    always proceeds (existing lookup is batch-scoped and finds nothing).
     """
 
     def __init__(
@@ -117,8 +131,10 @@ class InventoryManager:
         self, sel: TableSelection, force: bool, require_target_precreated: bool = False,
     ) -> "tuple[Optional[MigrationRecord], bool]":
         """Returns (record_or_None, target_was_missing)."""
-        # Check if already in control table
-        existing = self._get_existing(sel.source_fqn)
+        # Check if already in control table — scoped to (source table,
+        # THIS batch_id) so different batches never collide on one row.
+        batch_id = getattr(self._cfg, "batch_id", "") or ""
+        existing = self._get_existing(sel.source_fqn, batch_id)
 
         if existing and not force:
             if existing.get("status") in (
@@ -157,7 +173,12 @@ class InventoryManager:
         # Classify workload
         wl_class, wl_weight = self._cls.classify(inv.size_in_bytes)
 
-        # Build record
+        # Build record. `existing` is already scoped to THIS batch_id (see
+        # _get_existing above), so reusing its migration_id here only ever
+        # re-touches THIS batch's own row (idempotent re-run of the same
+        # batch). A different/new batch_id for the same source table always
+        # finds existing=None and gets a fresh migration_id → a brand-new
+        # row, leaving every other batch's row for this table untouched.
         mid = (existing or {}).get("migration_id") or str(uuid.uuid4())
         now = _TS()
         rec = MigrationRecord(
@@ -291,11 +312,17 @@ class InventoryManager:
         mid = str(uuid.uuid4())
         batch_id_val = (getattr(self._cfg, "batch_id", "") or "").replace("'", "\\'")
         try:
+            # Same batch_id-scoped identity key as _upsert()/_get_existing()/
+            # _mark_permanent_failure() — a table SKIPPED under batch_id=A
+            # must not collide with / block onboarding of the same table
+            # under a different batch_id=B (that new batch gets its own row,
+            # unaffected by this one being SKIPPED).
             q = f"""
             MERGE INTO {self._ctrl} AS t
             USING (SELECT '{sel.source_catalog}' AS sc, '{sel.source_schema}' AS ss,
-                          '{sel.source_table}' AS st) AS s
-            ON t.source_catalog = s.sc AND t.source_schema = s.ss AND t.source_table = s.st
+                          '{sel.source_table}' AS st, '{batch_id_val}' AS bid) AS s
+            ON t.source_catalog = s.sc AND t.source_schema = s.ss
+               AND t.source_table = s.st AND t.batch_id = s.bid
             WHEN MATCHED THEN UPDATE SET
               status = 'SKIPPED', error_code = 'TARGET_NOT_PRECREATED',
               error_message = '{msg_esc}', batch_id = '{batch_id_val}',
@@ -344,11 +371,30 @@ class InventoryManager:
 
     # ── Control table operations ──────────────────────────────────────────────
 
-    def _get_existing(self, source_fqn: str) -> Optional[dict]:
+    def _get_existing(self, source_fqn: str, batch_id: str) -> Optional[dict]:
+        """
+        Look up an existing migration_control row for this EXACT
+        (source table, batch_id) pair.
+
+        batch_id is part of the identity key here — deliberately. Each
+        batch_id gets its own row per source table, so that:
+          - Re-running INVENTORY twice for the SAME batch_id is idempotent
+            (finds and updates its own row, doesn't duplicate it).
+          - Onboarding the SAME source table under a DIFFERENT/new batch_id
+            always finds nothing here (existing=None) and therefore always
+            gets a brand-new row + a brand-new migration_id in
+            _process_one() — preserving that earlier batch's row (and its
+            batch_id, timestamps, row counts, error info) untouched forever.
+            Without batch_id in this lookup, a second batch touching the
+            same table would find and silently overwrite the first batch's
+            row (see git history for the pre-fix behavior) — the very bug
+            this scoping fixes.
+        """
         parts = source_fqn.split(".")
         if len(parts) != 3:
             return None
         cat, sch, tbl = parts
+        safe_bid = (batch_id or "").replace("'", "\\'")
         try:
             rows = self._tgt.execute(f"""
                 SELECT migration_id, status, attempt_number
@@ -356,6 +402,7 @@ class InventoryManager:
                 WHERE source_catalog = '{cat}'
                   AND source_schema  = '{sch}'
                   AND source_table   = '{tbl}'
+                  AND batch_id       = '{safe_bid}'
                 LIMIT 1
             """)
             return rows[0] if rows else None
@@ -363,14 +410,27 @@ class InventoryManager:
             return None
 
     def _upsert(self, rec: MigrationRecord) -> None:
-        """MERGE into migration_control (idempotent on migration_id)."""
+        """
+        MERGE into migration_control.
+
+        Identity key is (source_catalog, source_schema, source_table,
+        batch_id) — NOT bare migration_id. This is the authoritative
+        enforcement of "one row per table PER BATCH": even if Python-side
+        migration_id resolution in _process_one() ever got out of sync,
+        this MERGE's own match condition still guarantees a different
+        batch_id can never collide with / overwrite another batch's row for
+        the same source table — it will always fall to the INSERT branch
+        and create a new row instead.
+        """
         loc = (rec.source_path or "").replace("'", "\\'")
         err_msg = (rec.error_message or "").replace("'", "\\'")
         batch_id_val = (rec.batch_id or "").replace("'", "\\'")
         q = f"""
         MERGE INTO {self._ctrl} AS t
-        USING (SELECT '{rec.migration_id}' AS migration_id) AS s
-        ON t.migration_id = s.migration_id
+        USING (SELECT '{rec.source_catalog}' AS sc, '{rec.source_schema}' AS ss,
+                      '{rec.source_table}' AS st, '{batch_id_val}' AS bid) AS s
+        ON t.source_catalog = s.sc AND t.source_schema = s.ss
+           AND t.source_table = s.st AND t.batch_id = s.bid
         WHEN MATCHED THEN UPDATE SET
           run_id            = '{rec.run_id}',
           status            = '{rec.status}',
@@ -449,15 +509,25 @@ class InventoryManager:
         self._tgt.execute_ddl(q)
 
     def _mark_permanent_failure(self, sel: TableSelection, msg: str) -> None:
+        """
+        Same batch_id-scoped identity key as _upsert()/_get_existing() —
+        a source table that fails permanently under batch_id=A must not
+        collide with / block a later attempt of the same table under a
+        different batch_id=B. Also now stamps batch_id on both the UPDATE
+        and INSERT branches (previously omitted entirely, which is why a
+        FAILED_PERMANENT row never carried any batch_id at all).
+        """
         now = _TS()
         msg_esc = msg.replace("'", "\\'")[:500]
         mid = str(uuid.uuid4())
+        batch_id_val = (getattr(self._cfg, "batch_id", "") or "").replace("'", "\\'")
         try:
             q = f"""
             MERGE INTO {self._ctrl} AS t
             USING (SELECT '{sel.source_catalog}' AS sc, '{sel.source_schema}' AS ss,
-                          '{sel.source_table}' AS st) AS s
-            ON t.source_catalog = s.sc AND t.source_schema = s.ss AND t.source_table = s.st
+                          '{sel.source_table}' AS st, '{batch_id_val}' AS bid) AS s
+            ON t.source_catalog = s.sc AND t.source_schema = s.ss
+               AND t.source_table = s.st AND t.batch_id = s.bid
             WHEN MATCHED THEN UPDATE SET
               status = 'FAILED_PERMANENT', error_message = '{msg_esc}',
               updated_at = TIMESTAMP '{now}'
@@ -465,13 +535,13 @@ class InventoryManager:
               migration_id, run_id, clone_type, source_workspace, target_workspace,
               source_catalog, source_schema, source_table,
               target_catalog, target_schema, target_table,
-              status, error_message, created_at, updated_at
+              batch_id, status, error_message, created_at, updated_at
             ) VALUES (
               '{mid}', '{self._run_id}', '{self._cfg.clone_type}',
               '{self._cfg.source_workspace_url}', '{self._cfg.target_workspace_url}',
               '{sel.source_catalog}', '{sel.source_schema}', '{sel.source_table}',
               '{sel.target_catalog}', '{sel.target_schema}', '{sel.target_table}',
-              'FAILED_PERMANENT', '{msg_esc}',
+              '{batch_id_val}', 'FAILED_PERMANENT', '{msg_esc}',
               TIMESTAMP '{now}', TIMESTAMP '{now}'
             )
             """

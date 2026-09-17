@@ -1,0 +1,2 @@
+clone_type,source_catalog,source_schema,source_table,target_catalog,target_schema,target_table,exclude_schemas,exclude_tables
+table,ril_bulk_csvtest,finance,table_does_not_exist_xyz,ril_tgt_gate_test,finance,table_does_not_exist_xyz,,

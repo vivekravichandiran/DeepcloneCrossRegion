@@ -278,7 +278,22 @@ Two defects were found and fixed during testing (§11); both were re-tested and 
 
 **Expected Result:** All 3 tasks succeed in sequence; final `migration_control` state shows all tables `VALIDATED` with matching row counts.
 
-**Actual Result:** Confirmed on batch `batch-20260908-fullworkflow` — 4/4 tables `VALIDATED` (`dim_marketing_01/02`, `dim_iot_01/02`), matching row counts (1332/2283/2263/2287); repeated successfully on the auto-`batch_id` case (`batch-20260909-92b4ae`, 4/4 `VALIDATED` under `*_csvtest` target names) and the TC5 gate test (§10).
+**Actual Result:** Confirmed on batch `batch-20260908-fullworkflow` — 4/4 tables `VALIDATED` (`dim_marketing_01/02`, `dim_iot_01/02`), matching row counts (1332/2283/2263/2287); repeated successfully on the auto-`batch_id` case (`batch-20260909-92b4ae`, 4/4 `VALIDATED` under `*_csvtest` target names) and the TC5 gate test (§10). This is not a one-off — the job run history for `06_full_migration_workflow` shows **12/12 runs `TERMINATED`/`SUCCESS`** end-to-end across the whole test cycle, spanning basic CSV runs, auto-`batch_id` propagation, the UC-cluster-mode fix, the change-propagation test, and the governance-gate test:
+
+| Run ID | Timestamp (UTC) | Result | `batch_id` |
+|---|---|---|---|
+| 1001200177035914 | 2026-09-16 07:11 | SUCCESS | `tc5-full-workflow-gate` (TC-H5) |
+| 967964368805272 | 2026-09-10 07:36 | SUCCESS | `uc-clustermode-test-1` (TC-B2) |
+| 628385558016027 | 2026-09-10 06:45 | SUCCESS | `update-reflect-test-1` (TC-F2) |
+| 375044831657132 | 2026-09-09 02:23 | SUCCESS | auto-generated |
+| 996210166578391 | 2026-09-09 00:58 | SUCCESS | auto-generated |
+| 675995681858019 | 2026-09-09 00:39 | SUCCESS | auto-generated |
+| 589134917128743 | 2026-09-09 00:25 | SUCCESS | auto-generated |
+| 138029733720797 | 2026-09-09 00:10 | SUCCESS | auto-generated |
+| 466191691907938 | 2026-09-08 23:58 | SUCCESS | `batch-vk-02` |
+| 117676133778266 | 2026-09-08 23:48 | SUCCESS | auto-generated |
+| 73845698593665 | 2026-09-08 16:38 | SUCCESS | `batch-20260908-fullworkflow` |
+| 997034606395385 | 2026-09-08 16:13 | SUCCESS | `batch-20260908-fullworkflow` |
 
 **Status:** ✅ PASS
 

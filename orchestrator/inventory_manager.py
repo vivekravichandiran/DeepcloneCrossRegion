@@ -9,6 +9,10 @@ INVENTORY mode responsibilities:
 5. Idempotently upsert one migration_control record per table.
 6. Transition: DISCOVERED → ONBOARDED → WAITING_FOR_LOAD → QUEUED.
 
+Steps 1–4 can be skipped entirely via OrchestratorConfig.skip_describe_detail
+(opt-in, default off) — see that field's docstring for when/why. Tables are
+still onboarded as QUEUED, just with NULL size/file/version metadata.
+
 This module NEVER executes a clone. It only reads source metadata and
 writes to the control table.
 """
@@ -29,6 +33,18 @@ from orchestrator.workload_classifier import WorkloadClassifier
 log = logging.getLogger(__name__)
 
 _TS = lambda: datetime.now(tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _sql_num(v) -> str:
+    """Render an Optional numeric value as a NULL-safe SQL literal (unquoted)."""
+    return "NULL" if v is None else str(v)
+
+
+def _sql_str(v) -> str:
+    """Render an Optional string value as a NULL-safe, quote-escaped SQL literal."""
+    if v is None:
+        return "NULL"
+    return "'" + str(v).replace("'", "\\'") + "'"
 
 
 class InventoryManager:
@@ -92,6 +108,15 @@ class InventoryManager:
                 Default False preserves the original behavior (DEEP_CLONE
                 auto-creates the target table via CREATE OR REPLACE ... DEEP
                 CLONE — used by every prior test in this repo).
+
+            self._cfg.skip_describe_detail (read directly off config, not a
+                parameter here): when True, bypasses DESCRIBE DETAIL entirely
+                for every table — see OrchestratorConfig.skip_describe_detail
+                for the full rationale (storage firewall / ABAC errors that
+                block DESCRIBE DETAIL specifically). Tables are still
+                onboarded as QUEUED, but size_in_bytes/size_gb/
+                source_num_files/workload_class/workload_weight/
+                source_version are all left NULL in migration_control.
 
         Returns:
             {
@@ -163,15 +188,30 @@ class InventoryManager:
             self._mark_skipped_target_missing(sel, msg)
             return None, True
 
-        # Validate source existence (UC metadata check via API)
-        inv = self._run_describe_detail(sel)
-        if inv is None:
-            log.warning("Source table %s not found or not Delta — marking FAILED_PERMANENT", sel.source_fqn)
-            self._mark_permanent_failure(sel, "Source table not found or not a Delta table")
-            return None, False
+        # Validate source existence (UC metadata check via API) — unless the
+        # operator has explicitly opted out (skip_describe_detail=True).
+        if self._cfg.skip_describe_detail:
+            # DESCRIBE DETAIL bypassed entirely for this run — see
+            # OrchestratorConfig.skip_describe_detail docstring for when/why
+            # (e.g. Azure storage firewall or Delta Share ABAC errors that
+            # block DESCRIBE DETAIL specifically). No source existence/format
+            # check happens here in this mode — a bad source table will only
+            # surface later, as a DEEP_CLONE-time failure instead.
+            inv = TableInventory()   # every field defaults to None
+            wl_class, wl_weight = WorkloadClass.UNKNOWN.value, self._cfg.workload_weights.get("UNKNOWN", 0)
+            log.info(
+                "skip_describe_detail=true — onboarding %s without source metadata "
+                "(size/files/workload_class left NULL)", sel.source_fqn,
+            )
+        else:
+            inv = self._run_describe_detail(sel)
+            if inv is None:
+                log.warning("Source table %s not found or not Delta — marking FAILED_PERMANENT", sel.source_fqn)
+                self._mark_permanent_failure(sel, "Source table not found or not a Delta table")
+                return None, False
 
-        # Classify workload
-        wl_class, wl_weight = self._cls.classify(inv.size_in_bytes)
+            # Classify workload
+            wl_class, wl_weight = self._cls.classify(inv.size_in_bytes)
 
         # Build record. `existing` is already scoped to THIS batch_id (see
         # _get_existing above), so reusing its migration_id here only ever
@@ -195,7 +235,7 @@ class InventoryManager:
             target_table      = sel.target_table,
             source_path       = inv.source_path,
             size_in_bytes     = inv.size_in_bytes,
-            size_gb           = inv.size_in_bytes / (1024 ** 3),
+            size_gb           = (inv.size_in_bytes / (1024 ** 3)) if inv.size_in_bytes is not None else None,
             workload_class    = wl_class,
             workload_weight   = wl_weight,
             status            = MigrationStatus.QUEUED.value,
@@ -214,10 +254,16 @@ class InventoryManager:
 
         # Upsert to control table
         self._upsert(rec)
-        log.info(
-            "Onboarded %s → %s [%s %.2f GB w=%d]",
-            sel.source_fqn, sel.target_fqn, wl_class, rec.size_gb, wl_weight
-        )
+        if rec.size_gb is not None:
+            log.info(
+                "Onboarded %s → %s [%s %.2f GB w=%d]",
+                sel.source_fqn, sel.target_fqn, wl_class, rec.size_gb, wl_weight
+            )
+        else:
+            log.info(
+                "Onboarded %s → %s [%s — size unknown, DESCRIBE DETAIL skipped]",
+                sel.source_fqn, sel.target_fqn, wl_class,
+            )
         return rec, False
 
     # ── DESCRIBE DETAIL ───────────────────────────────────────────────────────
@@ -422,9 +468,19 @@ class InventoryManager:
         the same source table — it will always fall to the INSERT branch
         and create a new row instead.
         """
-        loc = (rec.source_path or "").replace("'", "\\'")
+        loc = _sql_str(rec.source_path)
         err_msg = (rec.error_message or "").replace("'", "\\'")
         batch_id_val = (rec.batch_id or "").replace("'", "\\'")
+        # NULL-safe: when onboarded with skip_describe_detail=True, these are
+        # all None on `rec` — must persist as real SQL NULL (not 0/"None"),
+        # so migration_control can distinguish "never measured" from
+        # "measured as zero". See OrchestratorConfig.skip_describe_detail.
+        size_bytes_sql = _sql_num(rec.size_in_bytes)
+        size_gb_sql    = "NULL" if rec.size_gb is None else f"{rec.size_gb:.6f}"
+        wl_class_sql   = _sql_str(rec.workload_class)
+        wl_weight_sql  = _sql_num(rec.workload_weight)
+        num_files_sql  = _sql_num(rec.source_num_files)
+        version_sql    = _sql_num(rec.source_version)
         q = f"""
         MERGE INTO {self._ctrl} AS t
         USING (SELECT '{rec.source_catalog}' AS sc, '{rec.source_schema}' AS ss,
@@ -434,15 +490,15 @@ class InventoryManager:
         WHEN MATCHED THEN UPDATE SET
           run_id            = '{rec.run_id}',
           status            = '{rec.status}',
-          source_path       = '{loc}',
-          size_in_bytes     = {rec.size_in_bytes},
-          size_gb           = {rec.size_gb:.6f},
-          workload_class    = '{rec.workload_class}',
-          workload_weight   = {rec.workload_weight},
+          source_path       = {loc},
+          size_in_bytes     = {size_bytes_sql},
+          size_gb           = {size_gb_sql},
+          workload_class    = {wl_class_sql},
+          workload_weight   = {wl_weight_sql},
           attempt_number    = 0,
           max_attempts      = {rec.max_attempts},
-          source_num_files  = {rec.source_num_files or 0},
-          source_version    = {rec.source_version or 0},
+          source_num_files  = {num_files_sql},
+          source_version    = {version_sql},
           batch_id          = '{batch_id_val}',
           -- Target mapping can legitimately change between onboards (e.g. a
           -- CSV/YAML edit renames the target table) — without updating these,
@@ -497,10 +553,10 @@ class InventoryManager:
           '{rec.source_workspace}', '{rec.target_workspace}',
           '{rec.source_catalog}', '{rec.source_schema}', '{rec.source_table}',
           '{rec.target_catalog}', '{rec.target_schema}', '{rec.target_table}',
-          '{loc}', {rec.size_in_bytes}, {rec.size_gb:.6f},
-          '{rec.workload_class}', {rec.workload_weight},
+          {loc}, {size_bytes_sql}, {size_gb_sql},
+          {wl_class_sql}, {wl_weight_sql},
           '{rec.status}', 0, {rec.max_attempts},
-          {rec.source_num_files or 0}, {rec.source_version or 0},
+          {num_files_sql}, {version_sql},
           '{batch_id_val}',
           TIMESTAMP '{rec.discovered_at}', TIMESTAMP '{rec.onboarded_at}', TIMESTAMP '{rec.queued_at}',
           TIMESTAMP '{rec.created_at}', TIMESTAMP '{rec.updated_at}'

@@ -83,6 +83,11 @@ resources:
         # target table).
         - name: require_target_precreated
           default: "${var.require_target_precreated}"
+        # skip_describe_detail: see the matching comment in
+        # resources/01_inventory_job.yml and databricks.yml. Default "false"
+        # preserves full DESCRIBE DETAIL metadata collection.
+        - name: skip_describe_detail
+          default: "${var.skip_describe_detail}"
         # target_warehouse_id / source_warehouse_id: plain (non-secret) SQL
         # warehouse identifiers — NOT credentials. No client_id/client_secret/
         # secret-scope anywhere: SqlClient/ApiClient authenticate natively via
@@ -122,6 +127,7 @@ resources:
               min_executors: "{{job.parameters.min_executors}}"
               force_reonboard: "{{job.parameters.force_reonboard}}"
               require_target_precreated: "{{job.parameters.require_target_precreated}}"
+              skip_describe_detail: "{{job.parameters.skip_describe_detail}}"
               target_warehouse_id: "{{job.parameters.target_warehouse_id}}"
               source_warehouse_id: "{{job.parameters.source_warehouse_id}}"
           job_cluster_key: orchestrator_cluster
@@ -267,9 +273,13 @@ resources:
               spark.sql.adaptive.enabled: "true"
             spark_env_vars:
               PYTHONPATH: "${workspace.file_path}"
-            cluster_log_conf:
-              dbfs:
-                destination: dbfs:/cluster-logs/deepclone
+            # NOTE: no cluster_log_conf here — dbfs:/ log delivery destinations
+            # are rejected outright ("INVALID_PARAMETER_VALUE: Invalid cluster
+            # log storage info") in workspaces where legacy DBFS root access is
+            # disabled (common alongside Unity Catalog hardening). Logs remain
+            # fully viewable live in the job run UI without this; re-add only
+            # as a volumes: destination pointing at a pre-provisioned UC Volume
+            # if durable log retention is required.
 
       # ── Notifications ──────────────────────────────────────────────────────
       email_notifications:

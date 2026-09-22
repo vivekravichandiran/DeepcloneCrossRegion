@@ -87,6 +87,18 @@ try:
     # original behavior — DEEP_CLONE auto-creates the target table via
     # CREATE OR REPLACE ... DEEP CLONE.
     dbutils.widgets.dropdown("require_target_precreated", "false", ["true", "false"])
+    # skip_describe_detail: opt-out of DESCRIBE DETAIL on the source entirely
+    # during INVENTORY. Tables are still onboarded as QUEUED (identity/
+    # mapping only), but size_in_bytes/size_gb/source_num_files/
+    # workload_class/workload_weight/source_version are all left NULL in
+    # migration_control instead of being measured. Use this when DESCRIBE
+    # DETAIL itself is failing for reasons outside this framework's control
+    # (e.g. an Azure storage account firewall rejecting the storage listing,
+    # or a Delta Share entity governed by an ABAC policy Databricks doesn't
+    # yet support for DESCRIBE DETAIL) — see
+    # OrchestratorConfig.skip_describe_detail for the full rationale.
+    # Default "false" preserves full inventory metadata collection.
+    dbutils.widgets.dropdown("skip_describe_detail", "false", ["true", "false"])
 except Exception:
     pass  # widgets already exist or running outside Databricks
 
@@ -278,6 +290,7 @@ _min_executors      = _get_widget("min_executors",         "8")
 _tgt_schema_override = _get_widget("target_schema", "")
 _force_reonboard = _get_widget("force_reonboard", "false").strip().lower() == "true"
 _require_target_precreated = _get_widget("require_target_precreated", "false").strip().lower() == "true"
+_skip_describe_detail = _get_widget("skip_describe_detail", "false").strip().lower() == "true"
 
 log.info("Widget values read directly: mode=%s meta=%s.%s", _wmode, _meta_catalog, _meta_schema)
 
@@ -297,6 +310,9 @@ if _input_type != "YAML" and _clone_type.strip():
     cfg.clone_type = _clone_type
 cfg.meta_catalog         = _meta_catalog
 cfg.meta_schema          = _meta_schema
+# skip_describe_detail is always widget-driven (like require_target_precreated) —
+# not owned by YAML/CSV, applies uniformly regardless of input_type.
+cfg.skip_describe_detail = _skip_describe_detail
 # Plain (non-secret) SQL warehouse ids — only override cfg if the widget was
 # actually supplied, so a YAML file's own target.warehouse_id (if set) isn't
 # silently clobbered by a blank job-parameter default.
@@ -606,11 +622,19 @@ if MODE in ("INVENTORY", "DRY_RUN"):
         )
         log.info(
             "Inventory complete: total=%d onboarded=%d skipped=%d (target_missing=%d) failed=%d "
-            "force_reonboard=%s require_target_precreated=%s",
+            "force_reonboard=%s require_target_precreated=%s skip_describe_detail=%s",
             stats["total"], stats["inserted"], stats["skipped"],
             stats["skipped_target_missing"], stats["failed"],
-            _force_reonboard, _require_target_precreated,
+            _force_reonboard, _require_target_precreated, _skip_describe_detail,
         )
+        if _skip_describe_detail and stats["inserted"]:
+            print(
+                f"  ⚠ skip_describe_detail=true — {stats['inserted']} table(s) onboarded "
+                f"WITHOUT source metadata: size_in_bytes/size_gb/source_num_files/"
+                f"workload_class are NULL in migration_control, and the source "
+                f"existence/Delta-format check was skipped (a bad source table will "
+                f"only surface as a DEEP_CLONE-time failure instead of an INVENTORY-time one)."
+            )
         if _require_target_precreated and stats["skipped_target_missing"]:
             print(
                 f"  ⚠ {stats['skipped_target_missing']} table(s) SKIPPED — target not "

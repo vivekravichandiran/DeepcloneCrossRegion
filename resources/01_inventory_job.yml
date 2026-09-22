@@ -86,6 +86,15 @@ resources:
         # original behavior (DEEP_CLONE auto-creates the target table).
         - name: require_target_precreated
           default: "${var.require_target_precreated}"
+        # skip_describe_detail: when "true", bypasses DESCRIBE DETAIL on the
+        # source entirely — tables are still onboarded as QUEUED but with
+        # NULL size/file/workload metadata. Use when DESCRIBE DETAIL itself
+        # is failing for reasons outside this framework's control (storage
+        # firewall, Delta Share ABAC policy — see databricks.yml comment for
+        # the full rationale). Default "false" preserves full metadata
+        # collection.
+        - name: skip_describe_detail
+          default: "${var.skip_describe_detail}"
 
       tasks:
         - task_key: inventory
@@ -112,6 +121,7 @@ resources:
               min_executors: "{{job.parameters.min_executors}}"
               force_reonboard: "{{job.parameters.force_reonboard}}"
               require_target_precreated: "{{job.parameters.require_target_precreated}}"
+              skip_describe_detail: "{{job.parameters.skip_describe_detail}}"
               target_warehouse_id: "{{job.parameters.target_warehouse_id}}"
               source_warehouse_id: "{{job.parameters.source_warehouse_id}}"
           job_cluster_key: orchestrator_cluster
@@ -129,9 +139,13 @@ resources:
               spark.databricks.delta.preview.enabled: "true"
             spark_env_vars:
               PYTHONPATH: "${workspace.file_path}"
-            cluster_log_conf:
-              dbfs:
-                destination: dbfs:/cluster-logs/deepclone
+            # NOTE: no cluster_log_conf here — dbfs:/ log delivery destinations
+            # are rejected outright ("INVALID_PARAMETER_VALUE: Invalid cluster
+            # log storage info") in workspaces where legacy DBFS root access is
+            # disabled (common alongside Unity Catalog hardening). Logs remain
+            # fully viewable live in the job run UI without this; re-add only
+            # as a volumes: destination pointing at a pre-provisioned UC Volume
+            # if durable log retention is required.
 
       email_notifications:
         on_failure:

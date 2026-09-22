@@ -46,10 +46,11 @@ class InputType(str, Enum):
 
 
 class WorkloadClass(str, Enum):
-    SMALL  = "SMALL"   # < 10 GB  → weight 1
-    MEDIUM = "MEDIUM"  # 10–100 GB → weight 3
-    LARGE  = "LARGE"   # 100 GB–1 TB → weight 8
-    XLARGE = "XLARGE"  # > 1 TB  → weight 20
+    SMALL   = "SMALL"    # < 10 GB  → weight 1
+    MEDIUM  = "MEDIUM"   # 10–100 GB → weight 3
+    LARGE   = "LARGE"    # 100 GB–1 TB → weight 8
+    XLARGE  = "XLARGE"   # > 1 TB  → weight 20
+    UNKNOWN = "UNKNOWN"  # size never measured (skip_describe_detail=true) → weight 0
 
 
 class MigrationStatus(str, Enum):
@@ -146,12 +147,20 @@ class TableSelection:
 
 @dataclass
 class TableInventory:
-    """Metadata captured during INVENTORY phase (DESCRIBE DETAIL output)."""
+    """
+    Metadata captured during INVENTORY phase (DESCRIBE DETAIL output).
+
+    All fields except is_delta are Optional and default to None — when
+    OrchestratorConfig.skip_describe_detail=True, DESCRIBE DETAIL is never
+    executed and a bare TableInventory() (all None) is used instead, so
+    migration_control ends up with NULL size/file/version metadata for that
+    table rather than misleading zeros.
+    """
     source_path:    Optional[str] = None   # abfss:// location
-    size_in_bytes:  int = 0
-    size_gb:        float = 0.0
-    num_files:      int = 0
-    format:         str = "DELTA"          # Confirm this is a Delta table
+    size_in_bytes:  Optional[int] = None
+    size_gb:        Optional[float] = None
+    num_files:      Optional[int] = None
+    format:         Optional[str] = "DELTA"   # Confirm this is a Delta table
     source_version: Optional[int] = None
     created_at:     Optional[str] = None
     last_modified:  Optional[str] = None
@@ -206,12 +215,16 @@ class MigrationRecord:
     batch_id:          str   = ""    # isolation key per migration owner
     chunk_id:          int   = 0     # which chunk within the batch (0 = unassigned)
 
-    # Inventory metadata
+    # Inventory metadata. size_in_bytes/size_gb/workload_class/workload_weight
+    # are all None when skip_describe_detail=True was used at onboarding time
+    # (see OrchestratorConfig.skip_describe_detail) — persisted as SQL NULL,
+    # not 0/"SMALL", so it's unambiguous in migration_control that these were
+    # never measured rather than measured-and-zero.
     source_path:       Optional[str] = None
-    size_in_bytes:     int   = 0
-    size_gb:           float = 0.0
-    workload_class:    str   = WorkloadClass.SMALL.value
-    workload_weight:   int   = 1
+    size_in_bytes:     Optional[int]   = None
+    size_gb:           Optional[float] = None
+    workload_class:    Optional[str]   = WorkloadClass.SMALL.value
+    workload_weight:   Optional[int]   = 1
 
     # Scheduling
     assigned_cluster_id: Optional[str] = None

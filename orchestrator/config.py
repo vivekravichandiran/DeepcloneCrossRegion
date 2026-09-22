@@ -32,10 +32,11 @@ DEFAULT_WORKLOAD_THRESHOLDS: Dict[str, int] = {
 }
 
 DEFAULT_WORKLOAD_WEIGHTS: Dict[str, int] = {
-    "SMALL":  1,
-    "MEDIUM": 3,
-    "LARGE":  8,
-    "XLARGE": 20,
+    "SMALL":   1,
+    "MEDIUM":  3,
+    "LARGE":   8,
+    "XLARGE":  20,
+    "UNKNOWN": 0,   # skip_describe_detail=true — size never measured
 }
 
 
@@ -95,6 +96,29 @@ class OrchestratorConfig:
     row_count_validation:      bool = False    # expensive — opt-in
     size_tolerance_pct:        float = 1.0     # acceptable size diff %
     file_count_tolerance_pct:  float = 5.0
+
+    # skip_describe_detail: when True, INVENTORY bypasses DESCRIBE DETAIL on
+    #   the source entirely for every table in the run. size_in_bytes,
+    #   size_gb, source_num_files, workload_class and workload_weight are all
+    #   left NULL in migration_control (not 0 — 0 would misleadingly imply
+    #   "verified empty"; NULL means "never checked"). source_version is also
+    #   left NULL, which the VALIDATE row-count check already tolerates by
+    #   falling back to an unversioned COUNT(*).
+    #   Use case: DESCRIBE DETAIL needs to list files in the source's
+    #   underlying storage, which can fail for reasons entirely outside this
+    #   framework's control — e.g. an Azure storage account firewall
+    #   rejecting the request, or a Delta Share entity governed by an ABAC
+    #   policy that Databricks does not yet support for DESCRIBE DETAIL. When
+    #   that happens on a whole batch of tables, this flag lets INVENTORY
+    #   still onboard them as QUEUED (identity/mapping only, no metadata) so
+    #   DEEP_CLONE can proceed — `CREATE TABLE ... DEEP CLONE` does not need
+    #   this metadata upfront. Trade-off: the non-Delta/"does the source even
+    #   exist" gate normally provided by DESCRIBE DETAIL is skipped too, so a
+    #   bad source table now only surfaces as a DEEP_CLONE-time failure
+    #   instead of an INVENTORY-time one. Default False preserves full
+    #   inventory metadata collection — only enable this when DESCRIBE DETAIL
+    #   itself is the thing failing.
+    skip_describe_detail:      bool = False
 
     # ── Batch / Chunk model ──
     # batch_id: user-defined isolation key. All INVENTORY, DEEP_CLONE and VALIDATE

@@ -104,9 +104,13 @@ resources:
               spark.databricks.delta.preview.enabled: "true"
             spark_env_vars:
               PYTHONPATH: "${workspace.file_path}"
-            cluster_log_conf:
-              dbfs:
-                destination: dbfs:/cluster-logs/deepclone
+            # NOTE: no cluster_log_conf here — dbfs:/ log delivery destinations
+            # are rejected outright ("INVALID_PARAMETER_VALUE: Invalid cluster
+            # log storage info") in workspaces where legacy DBFS root access is
+            # disabled (common alongside Unity Catalog hardening). Logs remain
+            # fully viewable live in the job run UI without this; re-add only
+            # as a volumes: destination pointing at a pre-provisioned UC Volume
+            # if durable log retention is required.
 
       email_notifications:
         on_failure:

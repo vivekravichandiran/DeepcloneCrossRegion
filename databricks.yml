@@ -219,6 +219,28 @@ variables:
     # used by every prior test in this repo).
     description: "Skip (don't queue) tables whose target doesn't already exist; require pre-provisioning"
     default: "false"
+  skip_describe_detail:
+    # When "true", INVENTORY never runs DESCRIBE DETAIL on the source at all.
+    # Tables are still onboarded as QUEUED, but size_in_bytes/size_gb/
+    # source_num_files/workload_class/workload_weight/source_version are all
+    # left NULL in migration_control (VALIDATE already tolerates a NULL
+    # source_version — falls back to an unversioned COUNT(*)). The source
+    # existence/Delta-format check normally done by DESCRIBE DETAIL is
+    # skipped too, so a bad source table now only surfaces as a DEEP_CLONE-
+    # time failure instead of an INVENTORY-time one.
+    # Use case: DESCRIBE DETAIL needs to list files in the source's
+    # underlying storage — this can fail for reasons entirely outside this
+    # framework's control, e.g. an Azure storage account firewall rejecting
+    # the request ("This Azure storage request is not authorized...Firewalls
+    # and virtual networks settings may be blocking access"), or a Delta
+    # Share entity governed by an ABAC policy that Databricks does not yet
+    # support for DESCRIBE DETAIL ("PERMISSION_DENIED: ... has ABAC policy
+    # governing the share owner, which is not supported yet"). Set this to
+    # "true" to still get the affected tables onboarded/deep-cloned while
+    # that external issue is being resolved by the storage/UC admin.
+    # Left "false" by default — recommended whenever DESCRIBE DETAIL works.
+    description: "Skip DESCRIBE DETAIL on source entirely during INVENTORY; leave size/file/workload metadata NULL"
+    default: "false"
 
   # Workspace paths
   orchestrator_notebook:

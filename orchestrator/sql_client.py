@@ -44,6 +44,10 @@ class SqlClient:
     _POLL_INTERVAL_S = 2
     _MAX_WAIT_S      = 300   # 5 minutes per statement
 
+    # Warehouse cold-start can be slow; wait up to 30 minutes for RUNNING.
+    _WAREHOUSE_START_TIMEOUT_S = 1800  # 30 minutes
+    _WAREHOUSE_START_POLL_S    = 5
+
     def __init__(
         self,
         warehouse_id:   str,
@@ -219,7 +223,12 @@ class SqlClient:
             timeout=30,
         )
         log.info("Warehouse %s start requested", self._wh)
-        for _ in range(30):
+        # A cold/auto-stopped warehouse (esp. serverless with capacity waits or
+        # a classic warehouse that must provision clusters) can take many
+        # minutes to reach RUNNING. Poll for up to 30 minutes so a slow start
+        # doesn't fail the run prematurely.
+        deadline = time.time() + self._WAREHOUSE_START_TIMEOUT_S
+        while time.time() < deadline:
             r = requests.get(
                 f"{self._url}/api/2.0/sql/warehouses/{self._wh}",
                 headers=self._headers(),
@@ -228,5 +237,8 @@ class SqlClient:
             if r.get("state") == "RUNNING":
                 log.info("Warehouse %s is RUNNING", self._wh)
                 return
-            time.sleep(5)
-        raise TimeoutError(f"Warehouse {self._wh} did not start within 150s")
+            time.sleep(self._WAREHOUSE_START_POLL_S)
+        raise TimeoutError(
+            f"Warehouse {self._wh} did not start within "
+            f"{self._WAREHOUSE_START_TIMEOUT_S}s"
+        )

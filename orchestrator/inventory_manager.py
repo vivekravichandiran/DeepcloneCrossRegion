@@ -15,11 +15,26 @@ still onboarded as QUEUED, just with NULL size/file/version metadata.
 
 This module NEVER executes a clone. It only reads source metadata and
 writes to the control table.
+
+Parallelism (OrchestratorConfig.inventory_parallel_threads, default 4):
+run_inventory() processes tables concurrently via a ThreadPoolExecutor — the
+per-table read round-trips (existing-row lookup, DESCRIBE DETAIL, DESCRIBE
+HISTORY — ~75% of the total SQL round-trips per table) all run in parallel.
+The final migration_control MERGE write for each table is deliberately kept
+fully serialized behind a single lock (_write_lock): concurrent Delta MERGE
+statements against the SAME table can throw
+DELTA_CONCURRENT_APPEND_EXCEPTION / ConcurrentAppendException even when they
+touch entirely different rows, so writes are not parallelized — only the
+slow reads are, which is where virtually all of INVENTORY's wall-clock time
+was actually going. Set inventory_parallel_threads=1 to fully restore the
+original strictly-sequential behavior.
 """
 
 from __future__ import annotations
 import logging
+import threading
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from typing import List, Optional
 
@@ -83,6 +98,13 @@ class InventoryManager:
         self._cls       = classifier
         self._run_id    = run_id
         self._ctrl      = f"{config.meta_catalog}.{config.meta_schema}.migration_control"
+        # Serializes every migration_control MERGE write across parallel
+        # INVENTORY worker threads — see module docstring / run_inventory()
+        # for why (avoids Delta concurrent-write conflicts on the shared
+        # control table). The read-heavy round-trips (DESCRIBE DETAIL/
+        # HISTORY/existing-row lookup) are NOT protected by this lock and
+        # run fully in parallel.
+        self._write_lock = threading.Lock()
 
     # ── Main entry ────────────────────────────────────────────────────────────
 
@@ -118,6 +140,14 @@ class InventoryManager:
                 source_num_files/workload_class/workload_weight/
                 source_version are all left NULL in migration_control.
 
+            self._cfg.inventory_parallel_threads (read directly off config):
+                number of tables processed concurrently — see module
+                docstring and OrchestratorConfig.inventory_parallel_threads
+                for the full rationale (reads are parallelized, the final
+                migration_control MERGE write is serialized). Default 4;
+                set to 1 to fully restore the original strictly-sequential
+                behavior.
+
         Returns:
             {
               "total":    int,
@@ -133,21 +163,45 @@ class InventoryManager:
             "total": 0, "inserted": 0, "skipped": 0,
             "skipped_target_missing": 0, "failed": 0, "records": [],
         }
-        for sel in selections:
-            stats["total"] += 1
+        if not selections:
+            return stats
+
+        n_threads = max(1, int(getattr(self._cfg, "inventory_parallel_threads", 1) or 1))
+        log.info(
+            "INVENTORY: processing %d table(s) with %d parallel thread(s) "
+            "(reads concurrent, migration_control writes serialized)",
+            len(selections), n_threads,
+        )
+
+        def _worker(sel: TableSelection):
             try:
                 rec, target_missing = self._process_one(sel, force, require_target_precreated)
-                if rec is None:
+                return sel, rec, target_missing, None
+            except Exception as e:
+                return sel, None, False, e
+
+        # Stats/records aggregation below runs entirely in THIS (the calling)
+        # thread, one completed future at a time via as_completed() — so it
+        # needs no lock of its own, even though the underlying SQL work
+        # happens concurrently across worker threads (which DO synchronize
+        # their migration_control MERGE writes via self._write_lock inside
+        # _upsert()/_mark_permanent_failure()/_mark_skipped_target_missing()).
+        with ThreadPoolExecutor(max_workers=n_threads, thread_name_prefix="inventory") as executor:
+            futures = [executor.submit(_worker, sel) for sel in selections]
+            for future in as_completed(futures):
+                sel, rec, target_missing, err = future.result()
+                stats["total"] += 1
+                if err is not None:
+                    stats["failed"] += 1
+                    log.error("Inventory failed for %s: %s", sel.source_fqn, err)
+                    self._mark_permanent_failure(sel, str(err))
+                elif rec is None:
                     stats["skipped"] += 1
                     if target_missing:
                         stats["skipped_target_missing"] += 1
                 else:
                     stats["inserted"] += 1
                     stats["records"].append(rec)
-            except Exception as e:
-                stats["failed"] += 1
-                log.error("Inventory failed for %s: %s", sel.source_fqn, e)
-                self._mark_permanent_failure(sel, str(e))
         return stats
 
     # ── Per-table logic ───────────────────────────────────────────────────────
@@ -411,7 +465,8 @@ class InventoryManager:
               TIMESTAMP '{now}', TIMESTAMP '{now}', TIMESTAMP '{now}'
             )
             """
-            self._tgt.execute_ddl(q)
+            with self._write_lock:   # see _upsert()'s matching comment
+                self._tgt.execute_ddl(q)
         except Exception as e:
             log.error("Could not record SKIPPED (target missing) for %s: %s", sel.source_fqn, e)
 
@@ -562,7 +617,12 @@ class InventoryManager:
           TIMESTAMP '{rec.created_at}', TIMESTAMP '{rec.updated_at}'
         )
         """
-        self._tgt.execute_ddl(q)
+        # Serialized across parallel INVENTORY worker threads — see
+        # module docstring / __init__'s _write_lock comment. Concurrent
+        # MERGE statements against the same Delta table can conflict even
+        # when touching disjoint rows.
+        with self._write_lock:
+            self._tgt.execute_ddl(q)
 
     def _mark_permanent_failure(self, sel: TableSelection, msg: str) -> None:
         """
@@ -601,6 +661,7 @@ class InventoryManager:
               TIMESTAMP '{now}', TIMESTAMP '{now}'
             )
             """
-            self._tgt.execute_ddl(q)
+            with self._write_lock:   # see _upsert()'s matching comment
+                self._tgt.execute_ddl(q)
         except Exception as e:
             log.error("Could not record permanent failure for %s: %s", sel.source_fqn, e)

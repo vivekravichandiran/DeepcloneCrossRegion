@@ -95,6 +95,15 @@ resources:
         # collection.
         - name: skip_describe_detail
           default: "${var.skip_describe_detail}"
+        # inventory_parallel_threads: number of tables INVENTORY processes
+        # concurrently (ThreadPoolExecutor). Reads (existing-row lookup,
+        # DESCRIBE DETAIL, DESCRIBE HISTORY) run in parallel; the final
+        # migration_control MERGE write per table is always serialized
+        # (see orchestrator/inventory_manager.py's _write_lock) to avoid
+        # Delta concurrent-write conflicts. Set to "1" to fully restore the
+        # original strictly-sequential behavior.
+        - name: inventory_parallel_threads
+          default: "${var.inventory_parallel_threads}"
 
       tasks:
         - task_key: inventory
@@ -122,6 +131,7 @@ resources:
               force_reonboard: "{{job.parameters.force_reonboard}}"
               require_target_precreated: "{{job.parameters.require_target_precreated}}"
               skip_describe_detail: "{{job.parameters.skip_describe_detail}}"
+              inventory_parallel_threads: "{{job.parameters.inventory_parallel_threads}}"
               target_warehouse_id: "{{job.parameters.target_warehouse_id}}"
               source_warehouse_id: "{{job.parameters.source_warehouse_id}}"
           job_cluster_key: orchestrator_cluster

@@ -145,6 +145,22 @@ class OrchestratorConfig:
     #   cluster.  Overrides num_workers in worker_cluster_config if lower.
     min_executors_per_chunk:   int   = 8
 
+    # inventory_parallel_threads: number of tables processed CONCURRENTLY
+    #   during INVENTORY, via a ThreadPoolExecutor in InventoryManager.
+    #   run_inventory(). A dedicated knob — separate from
+    #   parallel_threads_per_chunk — because INVENTORY runs before any chunk
+    #   exists, so it can't reuse that DEEP_CLONE-specific setting.
+    #   Only the read-heavy round-trips (existing-row lookup, DESCRIBE
+    #   DETAIL, DESCRIBE HISTORY — ~75% of the per-table SQL round-trips)
+    #   are actually parallelized; the final migration_control MERGE write
+    #   is always fully serialized (see InventoryManager._write_lock) to
+    #   avoid Delta concurrent-write conflicts on the shared control table.
+    #   Set to 1 to fully restore the original strictly-sequential behavior
+    #   (e.g. for debugging). Default 4 — the reads/writes are cheap
+    #   metadata-only SQL statements, so a warehouse comfortably handles
+    #   this level of concurrency.
+    inventory_parallel_threads: int   = 4
+
     # ── Execution ──
     stale_threshold_minutes:   int  = 120      # reconcile stuck IN_PROGRESS records
     poll_interval_s:           int  = 30

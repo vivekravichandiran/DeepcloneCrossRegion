@@ -241,6 +241,21 @@ variables:
     # Left "false" by default — recommended whenever DESCRIBE DETAIL works.
     description: "Skip DESCRIBE DETAIL on source entirely during INVENTORY; leave size/file/workload metadata NULL"
     default: "false"
+  inventory_parallel_threads:
+    # INVENTORY previously processed tables strictly one at a time — a
+    # single Python loop on the driver, each table needing 3-4 sequential
+    # SQL round-trips (existing-row lookup, DESCRIBE DETAIL, DESCRIBE
+    # HISTORY, final MERGE) via the SQL Statement Execution API. For a
+    # 100+ table batch that serializes into a very slow INVENTORY phase.
+    # This runs that many tables CONCURRENTLY via a ThreadPoolExecutor —
+    # the three read round-trips per table run in parallel; the final
+    # migration_control MERGE write is always serialized behind a lock
+    # (orchestrator/inventory_manager.py's _write_lock) to avoid Delta
+    # concurrent-write conflicts on the shared control table (which CAN
+    # happen even across MERGEs touching entirely different rows). Set to
+    # "1" to fully restore the original strictly-sequential behavior.
+    description: "Number of tables INVENTORY processes concurrently (reads parallel, control-table writes serialized)"
+    default: "4"
 
   # Workspace paths
   orchestrator_notebook:

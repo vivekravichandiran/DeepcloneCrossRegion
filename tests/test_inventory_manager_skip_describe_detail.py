@@ -32,6 +32,8 @@ module scope but this test never instantiates).
 from __future__ import annotations
 
 import sys
+import threading
+import time
 import types
 import uuid
 from pathlib import Path
@@ -82,22 +84,52 @@ class FakeSqlClient:
     fixed list-of-dict-rows or a zero-arg callable returning one. The FIRST
     matching key wins. Unmatched `execute()` calls return [] (e.g. so
     InventoryManager._get_existing() finds "no existing row").
+
+    `sleep_s`, when set, makes execute()/execute_ddl() hold the "connection"
+    for that long — used to prove/disprove concurrency deterministically via
+    the max_inflight/max_ddl_inflight high-water marks below, instead of
+    relying on flaky wall-clock timing assertions.
     """
 
-    def __init__(self, responses: Optional[Dict[str, Any]] = None):
+    def __init__(self, responses: Optional[Dict[str, Any]] = None, sleep_s: float = 0.0):
         self.responses: Dict[str, Any] = responses or {}
+        self.sleep_s = sleep_s
         self.execute_calls: List[str] = []
         self.ddl_calls: List[str] = []
 
+        self._lock = threading.Lock()
+        self._inflight = 0
+        self.max_inflight = 0        # high-water mark of concurrent execute() calls
+        self._ddl_inflight = 0
+        self.max_ddl_inflight = 0    # high-water mark of concurrent execute_ddl() calls
+
     def execute(self, sql: str, timeout_s: int = 300) -> List[Dict[str, Any]]:
-        self.execute_calls.append(sql)
-        for key, rows in self.responses.items():
-            if key in sql:
-                return rows() if callable(rows) else rows
-        return []
+        with self._lock:
+            self._inflight += 1
+            self.max_inflight = max(self.max_inflight, self._inflight)
+        try:
+            self.execute_calls.append(sql)
+            if self.sleep_s:
+                time.sleep(self.sleep_s)
+            for key, rows in self.responses.items():
+                if key in sql:
+                    return rows() if callable(rows) else rows
+            return []
+        finally:
+            with self._lock:
+                self._inflight -= 1
 
     def execute_ddl(self, sql: str) -> None:
-        self.ddl_calls.append(sql)
+        with self._lock:
+            self._ddl_inflight += 1
+            self.max_ddl_inflight = max(self.max_ddl_inflight, self._ddl_inflight)
+        try:
+            self.ddl_calls.append(sql)
+            if self.sleep_s:
+                time.sleep(self.sleep_s)
+        finally:
+            with self._lock:
+                self._ddl_inflight -= 1
 
     def execute_one(self, sql: str) -> Optional[Dict[str, Any]]:
         rows = self.execute(sql)
@@ -109,7 +141,11 @@ class FakeSqlClient:
 
 # ── Fixtures ──────────────────────────────────────────────────────────────
 
-def make_cfg(skip_describe_detail: bool, batch_id: str = "unit-test-batch") -> OrchestratorConfig:
+def make_cfg(
+    skip_describe_detail: bool,
+    batch_id: str = "unit-test-batch",
+    inventory_parallel_threads: int = 1,
+) -> OrchestratorConfig:
     cfg = OrchestratorConfig()
     cfg.meta_catalog = "test_meta_catalog"
     cfg.meta_schema  = "test_meta_schema"
@@ -117,6 +153,11 @@ def make_cfg(skip_describe_detail: bool, batch_id: str = "unit-test-batch") -> O
     cfg.max_retries  = 3
     cfg.clone_type   = "delta_share"
     cfg.skip_describe_detail = skip_describe_detail
+    # Existing tests above were written against the original strictly-
+    # sequential behavior — default here to 1 thread so they keep testing
+    # _process_one()/_upsert() in isolation without incidental concurrency.
+    # Dedicated parallelism tests below override this explicitly.
+    cfg.inventory_parallel_threads = inventory_parallel_threads
     return cfg
 
 
@@ -328,7 +369,111 @@ def test_run_inventory_idempotent_rerun_same_batch_skips():
     assert rec3 is None
 
 
-# ── 6: _sql_num / _sql_str helpers ────────────────────────────────────────
+# ── 6: inventory_parallel_threads ──────────────────────────────────────────
+# These use FakeSqlClient(sleep_s=...) high-water-mark counters instead of
+# wall-clock timing assertions, so they are deterministic (never flaky under
+# CI load) while still proving REAL concurrency occurred (not just "the code
+# didn't crash").
+
+N_TABLES = 8
+THREAD_SLEEP_S = 0.05
+
+
+def make_many_selections(n: int) -> List[TableSelection]:
+    return [make_selection(f"t{i}") for i in range(n)]
+
+
+def test_inventory_parallel_threads_reads_run_concurrently():
+    cfg = make_cfg(skip_describe_detail=False, inventory_parallel_threads=4)
+    src = FakeSqlClient(
+        responses={"DESCRIBE DETAIL": DESCRIBE_DETAIL_RESPONSE, "DESCRIBE HISTORY": DESCRIBE_HISTORY_RESPONSE},
+        sleep_s=THREAD_SLEEP_S,
+    )
+    tgt = FakeSqlClient(sleep_s=THREAD_SLEEP_S)
+    mgr = InventoryManager(cfg, src, tgt, WorkloadClassifier(cfg), run_id="run-1")
+
+    stats = mgr.run_inventory(make_many_selections(N_TABLES), force=False)
+
+    assert stats["total"] == N_TABLES
+    assert stats["inserted"] == N_TABLES
+    # The whole point: with 4 worker threads, more than one DESCRIBE DETAIL/
+    # HISTORY/existing-lookup call must have been in flight simultaneously.
+    assert src.max_inflight > 1, (
+        f"expected concurrent source reads with inventory_parallel_threads=4, "
+        f"got max_inflight={src.max_inflight}"
+    )
+    # But migration_control MERGE writes must NEVER overlap — that's the
+    # entire reason _write_lock exists (avoids Delta concurrent-write
+    # conflicts on the shared control table).
+    assert tgt.max_ddl_inflight == 1, (
+        f"migration_control writes must be fully serialized, "
+        f"got max_ddl_inflight={tgt.max_ddl_inflight}"
+    )
+    assert len(tgt.ddl_calls) == N_TABLES  # no writes lost or duplicated
+
+
+def test_inventory_parallel_threads_one_is_fully_sequential():
+    """inventory_parallel_threads=1 must fully restore the original
+    strictly-sequential behavior — no concurrency at all, anywhere."""
+    cfg = make_cfg(skip_describe_detail=False, inventory_parallel_threads=1)
+    src = FakeSqlClient(
+        responses={"DESCRIBE DETAIL": DESCRIBE_DETAIL_RESPONSE, "DESCRIBE HISTORY": DESCRIBE_HISTORY_RESPONSE},
+        sleep_s=THREAD_SLEEP_S,
+    )
+    tgt = FakeSqlClient(sleep_s=THREAD_SLEEP_S)
+    mgr = InventoryManager(cfg, src, tgt, WorkloadClassifier(cfg), run_id="run-1")
+
+    stats = mgr.run_inventory(make_many_selections(N_TABLES), force=False)
+
+    assert stats["total"] == N_TABLES
+    assert stats["inserted"] == N_TABLES
+    assert src.max_inflight == 1, "inventory_parallel_threads=1 must never overlap source reads"
+    assert tgt.max_ddl_inflight == 1
+    assert len(tgt.ddl_calls) == N_TABLES
+
+
+def test_inventory_parallel_threads_no_lost_or_duplicated_records_under_high_concurrency():
+    """Stress the aggregation path: many tables, more threads than tables,
+    zero artificial delay (maximizes race-condition exposure) — stats and
+    the records list must still be exactly correct, with no lost/duplicated
+    entries from the concurrent ThreadPoolExecutor + as_completed() loop."""
+    n = 40
+    cfg = make_cfg(skip_describe_detail=True, inventory_parallel_threads=16)
+    src = FakeSqlClient()
+    tgt = FakeSqlClient()
+    mgr = InventoryManager(cfg, src, tgt, WorkloadClassifier(cfg), run_id="run-1")
+
+    stats = mgr.run_inventory(make_many_selections(n), force=False)
+
+    assert stats["total"] == n
+    assert stats["inserted"] == n
+    assert stats["failed"] == 0
+    assert stats["skipped"] == 0
+    assert len(stats["records"]) == n
+    assert len({r.source_table for r in stats["records"]}) == n  # all distinct, none dropped/duplicated
+    assert len(tgt.ddl_calls) == n
+
+
+def test_inventory_parallel_threads_zero_or_negative_falls_back_to_one():
+    """orchestrator_notebook.py wraps the widget parse in try/except — a
+    non-numeric inventory_parallel_threads must not crash INVENTORY. This
+    test exercises the config-level guard directly: InventoryManager treats
+    any non-positive/invalid value as 1 (never 0 or negative, which would
+    make ThreadPoolExecutor raise)."""
+    cfg = make_cfg(skip_describe_detail=True)
+    cfg.inventory_parallel_threads = 0   # e.g. a bad override slipping through
+    src = FakeSqlClient()
+    tgt = FakeSqlClient()
+    mgr = InventoryManager(cfg, src, tgt, WorkloadClassifier(cfg), run_id="run-1")
+
+    # Must not raise ValueError("max_workers must be greater than 0") from
+    # ThreadPoolExecutor — run_inventory() clamps to at least 1.
+    stats = mgr.run_inventory(make_many_selections(3), force=False)
+    assert stats["total"] == 3
+    assert stats["inserted"] == 3
+
+
+# ── 7: _sql_num / _sql_str helpers ────────────────────────────────────────
 
 @pytest.mark.parametrize("value,expected", [
     (None, "NULL"),

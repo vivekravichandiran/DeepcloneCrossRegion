@@ -99,6 +99,16 @@ try:
     # OrchestratorConfig.skip_describe_detail for the full rationale.
     # Default "false" preserves full inventory metadata collection.
     dbutils.widgets.dropdown("skip_describe_detail", "false", ["true", "false"])
+    # inventory_parallel_threads: number of tables INVENTORY processes
+    # CONCURRENTLY (ThreadPoolExecutor) — the slow read round-trips
+    # (existing-row lookup, DESCRIBE DETAIL, DESCRIBE HISTORY) run in
+    # parallel; the final migration_control MERGE write is still fully
+    # serialized (see InventoryManager._write_lock) to avoid Delta
+    # concurrent-write conflicts. Dedicated knob — separate from
+    # parallel_threads (DEEP_CLONE's per-chunk thread count), since
+    # INVENTORY runs before any chunk exists. Set to "1" to fully restore
+    # the original strictly-sequential behavior. Default "4".
+    dbutils.widgets.text("inventory_parallel_threads", "4")
 except Exception:
     pass  # widgets already exist or running outside Databricks
 
@@ -291,6 +301,7 @@ _tgt_schema_override = _get_widget("target_schema", "")
 _force_reonboard = _get_widget("force_reonboard", "false").strip().lower() == "true"
 _require_target_precreated = _get_widget("require_target_precreated", "false").strip().lower() == "true"
 _skip_describe_detail = _get_widget("skip_describe_detail", "false").strip().lower() == "true"
+_inventory_parallel_threads = _get_widget("inventory_parallel_threads", "4")
 
 log.info("Widget values read directly: mode=%s meta=%s.%s", _wmode, _meta_catalog, _meta_schema)
 
@@ -313,6 +324,13 @@ cfg.meta_schema          = _meta_schema
 # skip_describe_detail is always widget-driven (like require_target_precreated) —
 # not owned by YAML/CSV, applies uniformly regardless of input_type.
 cfg.skip_describe_detail = _skip_describe_detail
+try:
+    cfg.inventory_parallel_threads = max(1, int(_inventory_parallel_threads))
+except ValueError:
+    log.warning(
+        "inventory_parallel_threads=%r is not a valid int — keeping default %d",
+        _inventory_parallel_threads, cfg.inventory_parallel_threads,
+    )
 # Plain (non-secret) SQL warehouse ids — only override cfg if the widget was
 # actually supplied, so a YAML file's own target.warehouse_id (if set) isn't
 # silently clobbered by a blank job-parameter default.
@@ -622,10 +640,12 @@ if MODE in ("INVENTORY", "DRY_RUN"):
         )
         log.info(
             "Inventory complete: total=%d onboarded=%d skipped=%d (target_missing=%d) failed=%d "
-            "force_reonboard=%s require_target_precreated=%s skip_describe_detail=%s",
+            "force_reonboard=%s require_target_precreated=%s skip_describe_detail=%s "
+            "inventory_parallel_threads=%d",
             stats["total"], stats["inserted"], stats["skipped"],
             stats["skipped_target_missing"], stats["failed"],
             _force_reonboard, _require_target_precreated, _skip_describe_detail,
+            cfg.inventory_parallel_threads,
         )
         if _skip_describe_detail and stats["inserted"]:
             print(

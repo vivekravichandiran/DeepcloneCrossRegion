@@ -88,6 +88,11 @@ resources:
         # preserves full DESCRIBE DETAIL metadata collection.
         - name: skip_describe_detail
           default: "${var.skip_describe_detail}"
+        # inventory_parallel_threads: see the matching comment in
+        # resources/01_inventory_job.yml and databricks.yml. Default 4;
+        # set to "1" to fully restore strictly-sequential INVENTORY.
+        - name: inventory_parallel_threads
+          default: "${var.inventory_parallel_threads}"
         # target_warehouse_id / source_warehouse_id: plain (non-secret) SQL
         # warehouse identifiers — NOT credentials. No client_id/client_secret/
         # secret-scope anywhere: SqlClient/ApiClient authenticate natively via
@@ -128,6 +133,7 @@ resources:
               force_reonboard: "{{job.parameters.force_reonboard}}"
               require_target_precreated: "{{job.parameters.require_target_precreated}}"
               skip_describe_detail: "{{job.parameters.skip_describe_detail}}"
+              inventory_parallel_threads: "{{job.parameters.inventory_parallel_threads}}"
               target_warehouse_id: "{{job.parameters.target_warehouse_id}}"
               source_warehouse_id: "{{job.parameters.source_warehouse_id}}"
           job_cluster_key: orchestrator_cluster

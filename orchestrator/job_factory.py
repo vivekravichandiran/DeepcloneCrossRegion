@@ -58,6 +58,9 @@ DEFAULT_PARAMS: Dict[str, Any] = {
     "validation_enabled": "true",
     "row_count_validation": "true",
     "max_retries": "3",
+    # retry_permanent: OPT-IN re-drive of FAILED_PERMANENT tables on RETRY.
+    # Default "false" keeps FAILED_PERMANENT terminal (safe default).
+    "retry_permanent": "false",
     # compute
     "worker_spark_version": "17.3.x-scala2.13",
     "worker_node_type": "Standard_E32ds_v5",
@@ -392,6 +395,7 @@ def build_retry_job(p: Dict[str, Any]) -> Dict[str, Any]:
             ("meta_catalog", p["meta_catalog"]),
             ("meta_schema", p["meta_schema"]),
             ("max_retries", p["max_retries"]),
+            ("retry_permanent", p["retry_permanent"]),
             ("worker_spark_version", p["worker_spark_version"]),
             ("batch_id", ""),
             ("max_concurrent_chunks", p["max_concurrent_chunks"]),
@@ -413,6 +417,7 @@ def build_retry_job(p: Dict[str, Any]) -> Dict[str, Any]:
                     "meta_catalog": "{{job.parameters.meta_catalog}}",
                     "meta_schema": "{{job.parameters.meta_schema}}",
                     "max_retries": "{{job.parameters.max_retries}}",
+                    "retry_permanent": "{{job.parameters.retry_permanent}}",
                     "batch_id": "{{job.parameters.batch_id}}",
                     "max_concurrent_chunks": "{{job.parameters.max_concurrent_chunks}}",
                     "parallel_threads": "{{job.parameters.parallel_threads}}",
@@ -455,6 +460,7 @@ def build_full_workflow_job(p: Dict[str, Any]) -> Dict[str, Any]:
             ("validation_enabled", p["validation_enabled"]),
             ("row_count_validation", p["row_count_validation"]),
             ("max_retries", p["max_retries"]),
+            ("retry_permanent", p["retry_permanent"]),
             ("selection_type", "catalog"),
             ("run_id", ""),
             ("batch_id", p["batch_id"]),
@@ -572,6 +578,7 @@ def build_full_workflow_job(p: Dict[str, Any]) -> Dict[str, Any]:
                         "meta_catalog": "{{job.parameters.meta_catalog}}",
                         "meta_schema": "{{job.parameters.meta_schema}}",
                         "max_retries": "{{job.parameters.max_retries}}",
+                        "retry_permanent": "{{job.parameters.retry_permanent}}",
                         "run_id": "{{job.parameters.run_id}}",
                         "batch_id": "{{tasks.inventory.values.batch_id}}",
                         "max_concurrent_chunks": "{{job.parameters.max_concurrent_chunks}}",

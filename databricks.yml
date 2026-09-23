@@ -92,6 +92,20 @@ variables:
   max_retries:
     description: "Max retry attempts per table"
     default: "3"
+  retry_permanent:
+    # OPT-IN re-drive of permanently-failed tables. RETRY normally only
+    # re-queues FAILED / RETRY_PENDING / VALIDATION_FAILED rows and leaves
+    # FAILED_PERMANENT (attempts exhausted or a non-retryable error code)
+    # alone. Set to "true" (at deploy time here, or as a run-now override on
+    # the RETRY / Full Workflow job) to have a RETRY run FIRST reset this
+    # batch's FAILED_PERMANENT rows back to RETRY_PENDING with a fresh attempt
+    # budget (AuditManager.reset_permanent_failures), then attempt them once
+    # more in the same run. A single run resets-then-attempts-once — no
+    # infinite loop; a table that re-fails simply returns to FAILED_PERMANENT.
+    # Left "false" by default so production RETRY runs keep FAILED_PERMANENT
+    # terminal (the safe, unchanged behaviour).
+    description: "Opt-in: also re-drive FAILED_PERMANENT tables on RETRY (reset to RETRY_PENDING with a fresh attempt budget). Default false = FAILED_PERMANENT stays terminal."
+    default: "false"
 
   # ── Orchestrator cluster (lightweight control plane, 1-2 nodes) ──────────────
   worker_spark_version:

@@ -49,6 +49,14 @@ try:
     # exclusions (default, zero behavior change).
     dbutils.widgets.text("exclusion_csv_path", "")
     dbutils.widgets.text("max_retries",      "3")
+    # retry_permanent: OPT-IN re-drive of permanently-failed tables. RETRY mode
+    # normally only re-queues status IN (FAILED, RETRY_PENDING, VALIDATION_FAILED)
+    # — FAILED_PERMANENT (attempts exhausted or a non-retryable error code) is
+    # terminal and left alone. Set to "true" to have a RETRY run FIRST reset this
+    # batch's FAILED_PERMANENT rows back to RETRY_PENDING with a fresh attempt
+    # budget (AuditManager.reset_permanent_failures), then attempt them once more
+    # in the same run. Default "false" preserves the safe terminal semantics.
+    dbutils.widgets.dropdown("retry_permanent", "false", ["true", "false"])
     dbutils.widgets.dropdown("validation_enabled",   "true",  ["true", "false"])
     dbutils.widgets.dropdown("row_count_validation", "false", ["true", "false"])
     dbutils.widgets.text("run_id", "")
@@ -252,6 +260,7 @@ log.info(
 )
 
 _max_retries = _get_widget("max_retries",        "3")
+_retry_permanent = _get_widget("retry_permanent", "false").strip().lower() == "true"
 _val_enabled = _get_widget("validation_enabled", "true")
 _row_cnt_val = _get_widget("row_count_validation","false")
 _run_id_wg          = _get_widget("run_id",              "")
@@ -342,6 +351,7 @@ cfg.validation_enabled   = _val_enabled.lower() == "true"
 cfg.row_count_validation = _row_cnt_val.lower() == "true"
 try: cfg.max_retries     = int(_max_retries)
 except ValueError: pass
+cfg.retry_permanent      = _retry_permanent
 # ── JOB-mode-only override ───────────────────────────────────────────────────
 # target_catalog (and source_catalogs/source_schemas/source_tables, applied
 # later via `params`) are databricks.yml bundle variables that exist ONLY to
@@ -857,8 +867,10 @@ elif MODE == "VALIDATE":
 
 # ─────────────────────────────── RETRY ────────────────────────────────────────
 elif MODE == "RETRY":
-    log.info("PHASE 4 — RETRY (batch=%s)", cfg.batch_id)
-    retry_stats = retry_mgr.run_retry(backoff=True, batch_id=cfg.batch_id)
+    log.info("PHASE 4 — RETRY (batch=%s, retry_permanent=%s)", cfg.batch_id, cfg.retry_permanent)
+    retry_stats = retry_mgr.run_retry(
+        backoff=True, batch_id=cfg.batch_id, retry_permanent=cfg.retry_permanent,
+    )
     log.info("Retry complete: %s", retry_stats)
 
     # After requeuing, run the chunk scheduler for retry tables

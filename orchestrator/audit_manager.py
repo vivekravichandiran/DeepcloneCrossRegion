@@ -339,6 +339,51 @@ class AuditManager:
               AND status IN ('RETRY_PENDING', 'FAILED', 'VALIDATION_FAILED')
         """)
 
+    def reset_permanent_failures(self, batch_id: str = "") -> int:
+        """
+        OPT-IN (retry_permanent=true): re-drive FAILED_PERMANENT rows.
+
+        Flips FAILED_PERMANENT → RETRY_PENDING for the given batch scope and
+        gives them a FRESH attempt budget (attempt_number reset to 0) so that
+        `attempt_number < max_attempts` holds again and RetryManager's
+        attempt-cap guard doesn't instantly re-mark them permanent. It also
+        clears error_code (recording the reset in error_message for audit) so
+        RetryManager's permanent-error-code guard doesn't immediately re-kill a
+        row that was originally marked permanent because of a non-retryable
+        error code — the operator has explicitly asked to re-attempt it once.
+
+        This is the ONLY path that leaves FAILED_PERMANENT; the default RETRY
+        flow never calls it, so FAILED_PERMANENT stays terminal unless
+        retry_permanent=true is passed. When batch_id is provided only that
+        batch's rows are reset (the same isolation used everywhere else).
+
+        Returns the number of rows reset.
+        """
+        now = _TS()
+        bf  = self._batch_filter(batch_id)
+        rows = self._sql.execute(f"""
+            SELECT migration_id
+            FROM {self._ctrl}
+            WHERE status = 'FAILED_PERMANENT' {bf}
+        """)
+        self._sql.execute_ddl(f"""
+            UPDATE {self._ctrl}
+            SET status = 'RETRY_PENDING',
+                attempt_number = 0,
+                error_code = NULL,
+                error_message = 'Reset from FAILED_PERMANENT by retry_permanent=true',
+                updated_at = TIMESTAMP '{now}'
+            WHERE status = 'FAILED_PERMANENT' {bf}
+        """)
+        count = len(rows)
+        if count:
+            log.info(
+                "Reset %d FAILED_PERMANENT record(s) → RETRY_PENDING "
+                "(retry_permanent=true, batch=%s)",
+                count, batch_id or "ALL",
+            )
+        return count
+
     # ── Stale record reconciliation ───────────────────────────────────────────
 
     def reconcile_stale_records(self, threshold_minutes: int = 120) -> int:

@@ -14,6 +14,12 @@ resources:
           default: ${var.meta_schema}
         - name: max_retries
           default: ${var.max_retries}
+        # retry_permanent: OPT-IN. "true" makes this RETRY run first reset the
+        # batch's FAILED_PERMANENT rows back to RETRY_PENDING (fresh attempt
+        # budget) so they get re-driven, then attempt them once. Default
+        # "false" keeps FAILED_PERMANENT terminal (unchanged behaviour).
+        - name: retry_permanent
+          default: ${var.retry_permanent}
         - name: worker_spark_version
           default: ${var.worker_spark_version}
         - name: batch_id
@@ -52,6 +58,7 @@ resources:
               meta_catalog: "{{job.parameters.meta_catalog}}"
               meta_schema: "{{job.parameters.meta_schema}}"
               max_retries: "{{job.parameters.max_retries}}"
+              retry_permanent: "{{job.parameters.retry_permanent}}"
               batch_id: "{{job.parameters.batch_id}}"
               max_concurrent_chunks: "{{job.parameters.max_concurrent_chunks}}"
               parallel_threads: "{{job.parameters.parallel_threads}}"

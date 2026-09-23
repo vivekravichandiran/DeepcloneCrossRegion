@@ -146,6 +146,7 @@ ABSTRACTED_DEFAULTS = {
     "input_type":           "CSV",      # this job is CSV-only
     "batch_id":             "",         # always auto-generated per run
     "max_retries":          "3",
+    "retry_permanent":      "false",    # opt-in re-drive of FAILED_PERMANENT (off by default)
     "skip_describe_detail": "false",    # always collect full source metadata
     "source_warehouse_id":  "",         # only used by clone_type=direct_adls
     # JOB-mode-only selection (unused in CSV mode; kept for spec fidelity)

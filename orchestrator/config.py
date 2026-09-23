@@ -91,6 +91,14 @@ class OrchestratorConfig:
     max_retries:         int = 3
     retry_backoff_base_s: int = 30      # exponential backoff base (seconds)
 
+    # retry_permanent: OPT-IN. When True, a RETRY run first resets THIS batch's
+    #   FAILED_PERMANENT rows back into the retry pipeline (see
+    #   AuditManager.reset_permanent_failures / RetryManager.run_retry) so an
+    #   operator can deliberately re-drive tables that were marked permanently
+    #   failed (exhausted attempts or a non-retryable error code). Default
+    #   False keeps FAILED_PERMANENT terminal — the safe, unchanged behaviour.
+    retry_permanent:     bool = False
+
     # ── Validation ──
     validation_enabled:        bool = True
     row_count_validation:      bool = False    # expensive — opt-in
@@ -234,6 +242,7 @@ def load_from_yaml(path: str) -> OrchestratorConfig:
 
     exec_ = raw.get("execution", {})
     cfg.max_retries             = exec_.get("max_retries",             cfg.max_retries)
+    cfg.retry_permanent         = exec_.get("retry_permanent",         cfg.retry_permanent)
     cfg.validation_enabled      = exec_.get("validation_enabled",      cfg.validation_enabled)
     cfg.row_count_validation    = exec_.get("row_count_validation",    cfg.row_count_validation)
     cfg.stale_threshold_minutes = exec_.get("stale_threshold_minutes", cfg.stale_threshold_minutes)

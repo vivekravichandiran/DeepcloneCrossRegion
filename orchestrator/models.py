@@ -107,7 +107,11 @@ VALID_TRANSITIONS: dict[MigrationStatus, set[MigrationStatus]] = {
     MigrationStatus.FAILED:           {MigrationStatus.RETRY_PENDING, MigrationStatus.FAILED_PERMANENT},
     MigrationStatus.RETRY_PENDING:    {MigrationStatus.QUEUED},
     MigrationStatus.VALIDATION_FAILED:{MigrationStatus.RETRY_PENDING, MigrationStatus.FAILED_PERMANENT},
-    MigrationStatus.FAILED_PERMANENT: set(),                                   # terminal
+    # FAILED_PERMANENT is terminal by DEFAULT (see TERMINAL_STATES below) — the
+    # normal RETRY path never leaves it. The only edges out exist for the
+    # OPT-IN retry_permanent=true reset (AuditManager.reset_permanent_failures),
+    # which re-drives permanently-failed rows back into the retry pipeline.
+    MigrationStatus.FAILED_PERMANENT: {MigrationStatus.RETRY_PENDING, MigrationStatus.QUEUED},
     MigrationStatus.SKIPPED:          set(),                                   # terminal
 }
 

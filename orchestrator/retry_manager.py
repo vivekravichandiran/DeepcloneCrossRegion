@@ -42,15 +42,36 @@ class RetryManager:
         self._cfg   = config
         self._audit = audit
 
-    def run_retry(self, backoff: bool = True, batch_id: str = "") -> dict:
+    def run_retry(self, backoff: bool = True, batch_id: str = "",
+                  retry_permanent: bool = False) -> dict:
         """
         Requeue all eligible records for another clone attempt.
 
         When batch_id is provided, only records from that batch are retried.
-        Returns: {"eligible": int, "requeued": int, "permanent": int}
+
+        When retry_permanent=True (OPT-IN, default False), this FIRST resets the
+        batch's FAILED_PERMANENT rows back to RETRY_PENDING with a fresh attempt
+        budget (AuditManager.reset_permanent_failures) so they get re-driven,
+        THEN runs the normal selection below. Because the reset zeroes
+        attempt_number and clears error_code, the two guards below
+        (permanent-error-code / attempt-cap) do NOT instantly re-kill the
+        just-reset rows — so a single run resets-then-attempts-once (no loop).
+        Default behaviour is unchanged: FAILED_PERMANENT stays terminal.
+
+        Returns: {"eligible": int, "requeued": int, "permanent": int,
+                  "reset_permanent": int}
         """
+        reset_permanent = 0
+        if retry_permanent:
+            reset_permanent = self._audit.reset_permanent_failures(batch_id=batch_id)
+            log.info(
+                "retry_permanent=true — reset %d FAILED_PERMANENT record(s) "
+                "back into the retry pipeline before selection", reset_permanent,
+            )
+
         records = self._audit.get_retryable_records(batch_id=batch_id)
-        stats   = {"eligible": len(records), "requeued": 0, "permanent": 0}
+        stats   = {"eligible": len(records), "requeued": 0, "permanent": 0,
+                   "reset_permanent": reset_permanent}
 
         log.info("Retry manager found %d eligible records", len(records))
 

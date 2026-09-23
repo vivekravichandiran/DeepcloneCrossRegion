@@ -51,6 +51,12 @@ resources:
           default: ${var.row_count_validation}
         - name: max_retries
           default: ${var.max_retries}
+        # retry_permanent: OPT-IN opt-in re-drive of FAILED_PERMANENT tables in
+        # the workflow's RETRY task. "true" resets this batch's
+        # FAILED_PERMANENT rows to RETRY_PENDING (fresh attempt budget) then
+        # attempts them once. Default "false" keeps FAILED_PERMANENT terminal.
+        - name: retry_permanent
+          default: ${var.retry_permanent}
         - name: selection_type
           default: catalog
         - name: run_id
@@ -221,6 +227,7 @@ resources:
               meta_catalog: "{{job.parameters.meta_catalog}}"
               meta_schema: "{{job.parameters.meta_schema}}"
               max_retries: "{{job.parameters.max_retries}}"
+              retry_permanent: "{{job.parameters.retry_permanent}}"
               run_id: "{{job.parameters.run_id}}"
               # See the comment on the deep_clone task above — read from the
               # published task value so this matches inventory's/deep_clone's

@@ -224,6 +224,29 @@ def test_standalone_clone_and_retry_carry_both_warehouse_ids(specs):
         assert bp["source_warehouse_id"] == "{{job.parameters.source_warehouse_id}}", name
 
 
+def test_retry_permanent_job_param_present_and_default_false(specs):
+    # OPT-IN FAILED_PERMANENT re-drive: the RETRY job and the Full Workflow job
+    # must both expose a `retry_permanent` job parameter, defaulted "false" so
+    # the safe terminal semantics are unchanged unless explicitly overridden.
+    for name in ("DeepClone 5 - RETRY [prod]", "DeepClone - Full Migration Workflow [prod]"):
+        pmap = {p["name"]: p["default"] for p in specs[name]["parameters"]}
+        assert "retry_permanent" in pmap, name
+        assert pmap["retry_permanent"] == "false", name
+
+
+def test_retry_permanent_wired_into_retry_base_parameters(specs):
+    # The RETRY task on both jobs must forward the job parameter into the
+    # notebook via {{job.parameters.retry_permanent}} templating (not eagerly
+    # resolved), exactly like max_retries.
+    retry_bp = specs["DeepClone 5 - RETRY [prod]"]["tasks"][0]["notebook_task"]["base_parameters"]
+    assert retry_bp["retry_permanent"] == "{{job.parameters.retry_permanent}}"
+
+    wf = specs["DeepClone - Full Migration Workflow [prod]"]
+    wf_retry = {t["task_key"]: t for t in wf["tasks"]}["retry"]
+    wf_retry_bp = wf_retry["notebook_task"]["base_parameters"]
+    assert wf_retry_bp["retry_permanent"] == "{{job.parameters.retry_permanent}}"
+
+
 def test_success_email_only_on_deep_clone_and_workflow(specs):
     def has_success(spec):
         return "on_success" in spec["email_notifications"]

@@ -156,29 +156,60 @@ class AuditManager:
         chunk_assignments: "List[ChunkAssignment]",     # type: ignore[name-defined]
     ) -> int:
         """
-        Write batch_id and chunk_id back to migration_control for every
-        table in the plan. Uses individual UPDATE statements (one per
-        migration_id) for atomicity and Delta compatibility.
+        Write batch_id and chunk_id back to migration_control for every table
+        in the plan.
 
-        Returns the total number of records updated.
+        P2: uses BATCHED set-based MERGE statements (a few hundred rows each)
+        instead of one single-row UPDATE per migration_id. At 1000+ tables the
+        old per-row loop issued one Delta commit per table, which degraded
+        super-linearly (the classic "many tiny sequential Delta UPDATEs on one
+        table" anti-pattern) and could take hours. This collapses it to
+        ceil(N / batch_size) commits.
+
+        Returns the total number of (migration_id, chunk_id) assignments applied.
         """
         now = _TS()
         safe_bid = batch_id.replace("'", "\\'")
+        # Flatten to (migration_id, chunk_id) pairs across all chunks.
+        pairs = [
+            (mid, chunk.chunk_id)
+            for chunk in chunk_assignments
+            for mid in chunk.migration_ids
+        ]
+        if not pairs:
+            return 0
+
+        batch_size = 500
         updated = 0
-        for chunk in chunk_assignments:
-            cid = chunk.chunk_id
-            for mid in chunk.migration_ids:
-                self._sql.execute_ddl(f"""
-                    UPDATE {self._ctrl}
-                    SET batch_id   = '{safe_bid}',
-                        chunk_id   = {cid},
-                        updated_at = TIMESTAMP '{now}'
-                    WHERE migration_id = '{mid}'
-                      AND status = 'QUEUED'
-                """)
-                updated += 1
-        log.info("Assigned batch_id=%s to %d records across %d chunks",
-                 batch_id, updated, len(chunk_assignments))
+        for i in range(0, len(pairs), batch_size):
+            batch = pairs[i:i + batch_size]
+            values = ", ".join(
+                f"('{str(mid).replace(chr(39), chr(92) + chr(39))}', {int(cid)})"
+                for mid, cid in batch
+            )
+            # NOTE: the column-alias form `(VALUES ...) AS s(mid, cid)` is NOT
+            # allowed directly in a MERGE USING clause on Databricks
+            # ([COLUMN_ALIASES_NOT_ALLOWED] / SQLSTATE 42601). Wrap the VALUES
+            # in a SELECT subquery so the aliases live inside the derived table.
+            self._sql.execute_ddl(f"""
+                MERGE INTO {self._ctrl} AS t
+                USING (
+                    SELECT CAST(mid AS STRING) AS mid, CAST(cid AS INT) AS cid
+                    FROM (VALUES {values}) AS v(mid, cid)
+                ) AS s
+                ON t.migration_id = s.mid AND t.status = 'QUEUED'
+                WHEN MATCHED THEN UPDATE SET
+                    batch_id   = '{safe_bid}',
+                    chunk_id   = s.cid,
+                    updated_at = TIMESTAMP '{now}'
+            """)
+            updated += len(batch)
+        log.info(
+            "Assigned batch_id=%s to %d records across %d chunks "
+            "(%d batched MERGE statement(s), batch_size=%d)",
+            batch_id, updated, len(chunk_assignments),
+            (len(pairs) + batch_size - 1) // batch_size, batch_size,
+        )
         return updated
 
     # ── State transitions ─────────────────────────────────────────────────────
@@ -326,6 +357,106 @@ class AuditManager:
               AND status = 'COMPLETED'
         """)
 
+    def mark_validation_batch(self, outcomes: "List[Dict]", batch_size: int = 200) -> int:
+        """
+        P3: batched COMPLETED → VALIDATED / VALIDATION_FAILED for many tables in
+        a few set-based MERGE commits instead of one UPDATE per table.
+
+        `outcomes` is a list of dicts, each with keys:
+          migration_id, status ('VALIDATED'|'VALIDATION_FAILED'), message,
+          source_row_count (int|None), target_row_count (int|None).
+
+        Row counts use COALESCE(new, existing) so a run with row-count checking
+        OFF (counts None) never blanks out counts recorded by an earlier ON run
+        — mirroring the single-row _row_count_set_clause() semantics.
+        """
+        if not outcomes:
+            return 0
+        now = _TS()
+        written = 0
+        for i in range(0, len(outcomes), batch_size):
+            batch = outcomes[i:i + batch_size]
+            rows = []
+            for o in batch:
+                mid = str(o["migration_id"]).replace("'", "\\'")
+                st  = str(o["status"]).replace("'", "\\'")
+                msg = str(o.get("message") or "").replace("'", "\\'")[:1000]
+                src = "NULL" if o.get("source_row_count") is None else str(int(o["source_row_count"]))
+                tgt = "NULL" if o.get("target_row_count") is None else str(int(o["target_row_count"]))
+                rows.append(f"('{mid}', '{st}', '{msg}', {src}, {tgt})")
+            values = ",\n              ".join(rows)
+            self._sql.execute_ddl(f"""
+                MERGE INTO {self._ctrl} AS t
+                USING (
+                    SELECT CAST(mid AS STRING) AS mid, CAST(st AS STRING) AS st,
+                           CAST(msg AS STRING) AS msg,
+                           CAST(src AS BIGINT) AS src, CAST(tgt AS BIGINT) AS tgt
+                    FROM (VALUES
+                      {values}
+                    ) AS v(mid, st, msg, src, tgt)
+                ) AS s
+                ON t.migration_id = s.mid AND t.status = 'COMPLETED'
+                WHEN MATCHED THEN UPDATE SET
+                    status             = s.st,
+                    validation_status  = s.st,
+                    validation_message = s.msg,
+                    source_row_count   = COALESCE(s.src, t.source_row_count),
+                    target_row_count   = COALESCE(s.tgt, t.target_row_count),
+                    updated_at         = TIMESTAMP '{now}'
+            """)
+            written += len(batch)
+        log.info("Batched validation-status write: %d record(s) in %d MERGE(s)",
+                 written, (len(outcomes) + batch_size - 1) // batch_size)
+        return written
+
+    def record_validation_history_batch(self, outcomes: "List[Dict]", batch_size: int = 200) -> int:
+        """
+        P3: batched append to migration_validation_history — one multi-row
+        INSERT per batch instead of one INSERT per table. Column order matches
+        record_validation_history(). Each outcome dict carries the same keys as
+        mark_validation_batch() plus `record` (the migration_control row, for
+        batch_id / source_version / target_version / FQN parts),
+        `row_count_checked` (bool) and `row_count_matched` (bool|None).
+        """
+        if not outcomes:
+            return 0
+        now = _TS()
+        tbl = f"{self._cfg.meta_catalog}.{self._cfg.meta_schema}.migration_validation_history"
+
+        def _q(x) -> str:
+            return str(x if x is not None else "").replace("'", "\\'")
+
+        written = 0
+        for i in range(0, len(outcomes), batch_size):
+            batch = outcomes[i:i + batch_size]
+            rows = []
+            for o in batch:
+                rec = o.get("record") or {}
+                sv  = rec.get("source_version")
+                tv  = rec.get("target_version")
+                src = o.get("source_row_count")
+                tgt = o.get("target_row_count")
+                matched = o.get("row_count_matched")
+                rows.append(
+                    "("
+                    f"'{_q(self._run_id)}', '{_q(o['migration_id'])}', '{_q(rec.get('batch_id'))}', "
+                    f"'{_q(rec.get('source_catalog'))}', '{_q(rec.get('source_schema'))}', '{_q(rec.get('source_table'))}', "
+                    f"'{_q(rec.get('target_catalog'))}', '{_q(rec.get('target_schema'))}', '{_q(rec.get('target_table'))}', "
+                    f"{str(int(sv)) if sv is not None else 'NULL'}, {str(int(tv)) if tv is not None else 'NULL'}, "
+                    f"{'true' if o.get('row_count_checked') else 'false'}, "
+                    f"{str(int(src)) if src is not None else 'NULL'}, {str(int(tgt)) if tgt is not None else 'NULL'}, "
+                    f"{'NULL' if matched is None else ('true' if matched else 'false')}, "
+                    f"'{_q(o['status'])}', '{_q(o.get('message'))[:1000]}', "
+                    f"TIMESTAMP '{now}', TIMESTAMP '{now}'"
+                    ")"
+                )
+            stmt = f"INSERT INTO {tbl} VALUES\n              " + ",\n              ".join(rows)
+            self._sql.execute_ddl(stmt)
+            written += len(batch)
+        log.info("Batched validation-history write: %d row(s) in %d INSERT(s)",
+                 written, (len(outcomes) + batch_size - 1) // batch_size)
+        return written
+
     def requeue_for_retry(self, migration_id: str) -> None:
         """RETRY_PENDING → QUEUED, increment attempt_number."""
         now = _TS()
@@ -395,32 +526,29 @@ class AuditManager:
         is source of truth; stale IN_PROGRESS/ASSIGNED records can be reconciled.'
         """
         now = _TS()
-        rows = self._sql.execute(f"""
-            SELECT migration_id, status, started_at
-            FROM {self._ctrl}
-            WHERE status IN ('IN_PROGRESS', 'ASSIGNED')
-              AND (
-                started_at IS NULL
-                OR TIMESTAMPDIFF(MINUTE, started_at, TIMESTAMP '{now}') > {threshold_minutes}
-              )
-        """)
-        count = 0
-        for r in rows:
-            mid = r["migration_id"]
-            log.warning("Reconciling stale %s record %s (stuck since %s)",
-                        r["status"], mid[:8], r.get("started_at"))
+        # P4: single set-based reconcile instead of a SELECT + per-row UPDATE
+        # loop. Count first (for the return value / log), then flip every stale
+        # row in ONE UPDATE — no round-trip per stale record. Both statements
+        # share the same `now` so the count and the UPDATE see the same window.
+        stale_predicate = (
+            "status IN ('IN_PROGRESS', 'ASSIGNED') "
+            "AND (started_at IS NULL "
+            f"OR TIMESTAMPDIFF(MINUTE, started_at, TIMESTAMP '{now}') > {threshold_minutes})"
+        )
+        rows = self._sql.execute(
+            f"SELECT COUNT(*) AS n FROM {self._ctrl} WHERE {stale_predicate}"
+        )
+        count = int((rows[0].get("n") if rows else 0) or 0)
+        if count:
             self._sql.execute_ddl(f"""
                 UPDATE {self._ctrl}
                 SET status = 'RETRY_PENDING',
                     error_code = 'STALE_EXECUTION',
                     error_message = 'Record was IN_PROGRESS/ASSIGNED beyond stale threshold; requeued',
                     updated_at = TIMESTAMP '{now}'
-                WHERE migration_id = '{mid}'
-                  AND status IN ('IN_PROGRESS', 'ASSIGNED')
+                WHERE {stale_predicate}
             """)
-            count += 1
-        if count:
-            log.info("Reconciled %d stale records → RETRY_PENDING", count)
+            log.info("Reconciled %d stale records → RETRY_PENDING (single set-based UPDATE)", count)
         return count
 
     # ── Attempt history ───────────────────────────────────────────────────────

@@ -191,6 +191,28 @@ def clone_table(rec: dict) -> dict:
     except Exception as e:
         log.warning("[Thread] Could not create schema %s.%s: %s", tgt_cat, tgt_sch, e)
 
+    # ── Capture the ACTUAL source version being cloned (at CLONE time) ────────
+    # DEEP CLONE reads the source's LIVE/current version, which may be NEWER
+    # than the version recorded at INVENTORY time — the source table can receive
+    # writes during the (potentially long) QUEUED gap between inventory and this
+    # clone. We read it here as a fallback and, on success below, prefer the
+    # exact sourceVersion the CLONE operation itself recorded. This value is
+    # persisted back to migration_control.source_version on COMPLETED so VALIDATE
+    # counts the source AS OF the version that was truly cloned (not the stale
+    # inventory version, which caused false row-count mismatches). Read against
+    # the SAME source reference the clone uses.
+    if clone_type != "delta_share" and src_path and src_path.startswith("abfss://"):
+        _src_hist_ref = f"delta.`{src_path}`"
+    else:
+        _src_hist_ref = src_fqn
+    cloned_source_version = None
+    try:
+        _sv_rows = spark.sql(f"DESCRIBE HISTORY {_src_hist_ref} LIMIT 1").collect()
+        if _sv_rows:
+            cloned_source_version = _sv_rows[0].asDict().get("version")
+    except Exception as e:
+        log.warning("[Thread] Could not read pre-clone source version for %s: %s", mid[:8], e)
+
     # Execute clone
     success = False
     error_code = None
@@ -226,7 +248,18 @@ def clone_table(rec: dict) -> dict:
             target_size_bytes = int(detail.get("sizeInBytes") or 0)
             hist = spark.sql(f"DESCRIBE HISTORY {tgt_fqn} LIMIT 1").collect()
             if hist:
-                target_version = hist[0].asDict().get("version")
+                h0 = hist[0].asDict()
+                target_version = h0.get("version")
+                # Prefer the EXACT source version the CLONE operation recorded
+                # (race-free) over the pre-clone DESCRIBE HISTORY read above. A
+                # DEEP CLONE commit exposes it in operationParameters.sourceVersion.
+                op_params = h0.get("operationParameters") or {}
+                sv = op_params.get("sourceVersion") if hasattr(op_params, "get") else None
+                if sv is not None:
+                    try:
+                        cloned_source_version = int(sv)
+                    except (TypeError, ValueError):
+                        pass
         except Exception as e:
             log.warning("[Thread] Could not fetch post-clone metrics: %s", e)
 
@@ -235,6 +268,13 @@ def clone_table(rec: dict) -> dict:
     if success:
         tnf = target_num_files if target_num_files is not None else "NULL"
         tv  = target_version   if target_version   is not None else "NULL"
+        # Overwrite the stale inventory-time source_version with the version
+        # actually cloned. Only emit the column when we captured a value, so a
+        # capture failure never clobbers the existing inventory value with NULL.
+        sv_set = (
+            f"source_version = {int(cloned_source_version)},\n                    "
+            if cloned_source_version is not None else ""
+        )
         try:
             spark.sql(f"""
                 UPDATE {CTRL_TABLE}
@@ -243,7 +283,7 @@ def clone_table(rec: dict) -> dict:
                     duration_seconds = {duration_s},
                     target_num_files = {tnf},
                     target_version   = {tv},
-                    error_code       = NULL,
+                    {sv_set}error_code       = NULL,
                     error_message    = NULL,
                     updated_at       = TIMESTAMP '{completed_at}'
                 WHERE migration_id = '{mid}'

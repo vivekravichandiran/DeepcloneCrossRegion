@@ -69,13 +69,14 @@ resources:
               # No spark_env_vars needed — chunk_worker_notebook.py runs DEEP
               # CLONE directly via Spark on its own cluster and never calls
               # SqlClient/ApiClient, so it has no auth/secrets dependency.
-              # Provisioned on-demand (NOT via the shared control-plane
-              # instance_pool_id — see resources/03_deep_clone_job.yml).
+              # Chunk workers ALWAYS use the pre-warmed instance pool
+              # (var.worker_instance_pool_id) — node type governed by the pool,
+              # so no node_type_id/azure_attributes here (see
+              # resources/03_deep_clone_job.yml).
               worker_cluster_json: >
                 {
                   "spark_version": "${var.worker_spark_version}",
-                  "node_type_id": "${var.worker_node_type}",
-                  "azure_attributes": {"availability": "ON_DEMAND_AZURE"},
+                  "instance_pool_id": "${var.worker_instance_pool_id}",
                   "num_workers": ${var.worker_num_workers},
                   "data_security_mode": "DATA_SECURITY_MODE_AUTO"
                 }

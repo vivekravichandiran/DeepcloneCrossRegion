@@ -173,9 +173,29 @@ def test_worker_cluster_json_embedded(specs):
     dc = specs["DeepClone 3 - DEEP_CLONE [prod]"]
     wcj = dc["tasks"][0]["notebook_task"]["base_parameters"]["worker_cluster_json"]
     parsed = json.loads(wcj)   # must be a valid JSON *string*
-    assert parsed["node_type_id"] == "Standard_E32ds_v5"
+    # Chunk workers ALWAYS use the pre-warmed instance pool by default — node
+    # type is governed by the pool, so node_type_id/azure_attributes must be
+    # absent to avoid an invalid "both pool and node type" cluster spec.
+    assert parsed["instance_pool_id"] == "0924-004044-comic1-pool-63p33jj6"
+    assert "node_type_id" not in parsed
+    assert "azure_attributes" not in parsed
     assert parsed["num_workers"] == 8
     assert parsed["data_security_mode"] == "DATA_SECURITY_MODE_AUTO"
+
+
+def test_worker_cluster_json_falls_back_to_on_demand_when_no_pool(params):
+    """With worker_instance_pool_id blank, chunk workers revert to on-demand
+    node_type_id provisioning (no instance_pool_id)."""
+    p = dict(params)
+    p["worker_instance_pool_id"] = ""
+    specs = build_all_job_specs(p)
+    dc = specs["DeepClone 3 - DEEP_CLONE [prod]"]
+    parsed = json.loads(
+        dc["tasks"][0]["notebook_task"]["base_parameters"]["worker_cluster_json"]
+    )
+    assert "instance_pool_id" not in parsed
+    assert parsed["node_type_id"] == "Standard_E32ds_v5"
+    assert parsed["azure_attributes"]["availability"] == "ON_DEMAND_AZURE"
 
 
 # ── 6. Serialisable + reset wrapping ─────────────────────────────────────────

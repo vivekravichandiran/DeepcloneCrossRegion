@@ -141,6 +141,17 @@ variables:
     description: "Instance pool ID for the orchestrator control-plane job_clusters only (fast start for debugging/dev iteration)"
     default: "0908-093007-hoped4-pool-q4mi8hia"
 
+  # ── Chunk-worker instance pool ────────────────────────────────────────────
+  # Chunk worker clusters (one per DEEP_CLONE/RETRY chunk) ALWAYS provision
+  # from this pool. Pre-warmed instances avoid on-demand Azure capacity
+  # failures (AZURE_QUOTA_EXCEEDED_EXCEPTION / CLOUD_PROVIDER_RESOURCE_STOCKOUT
+  # in eastus). The pool's own node type governs VM size, so worker_node_type
+  # is ignored while this is set. Leave blank to revert to on-demand
+  # node_type_id=${var.worker_node_type} provisioning.
+  worker_instance_pool_id:
+    description: "Instance pool ID for the ephemeral chunk-worker clusters (DEEP_CLONE/RETRY). Blank = on-demand worker_node_type."
+    default: "0924-004044-comic1-pool-63p33jj6"
+
   # ── SQL warehouse IDs — plain, non-secret identifiers (NOT credentials) ──────
   # No client_id/client_secret/Databricks Secret scope exists anywhere in this
   # bundle. SqlClient/ApiClient authenticate natively via the Databricks SDK's
@@ -228,11 +239,13 @@ variables:
     # (schema/partitioning/grants) by another team before DEEP_CLONE is
     # allowed to land data. Once the target is created, re-run INVENTORY
     # with force_reonboard=true to re-check and queue it.
-    # Left "false" by default so DEEP_CLONE keeps auto-creating target
-    # tables via CREATE OR REPLACE ... DEEP CLONE (the original behavior,
-    # used by every prior test in this repo).
+    # Defaulted "true" (governance gate ON): targets must be pre-provisioned
+    # before DEEP_CLONE will land data — a table whose target doesn't exist is
+    # SKIPPED (TARGET_NOT_PRECREATED) rather than auto-created. Set to "false"
+    # (deploy-time here or as a run-now override) to restore the original
+    # auto-create-via-DEEP-CLONE behavior.
     description: "Skip (don't queue) tables whose target doesn't already exist; require pre-provisioning"
-    default: "false"
+    default: "true"
   skip_describe_detail:
     # When "true", INVENTORY never runs DESCRIBE DETAIL on the source at all.
     # Tables are still onboarded as QUEUED, but size_in_bytes/size_gb/

@@ -202,6 +202,14 @@ class InventoryManager:
                 else:
                     stats["inserted"] += 1
                     stats["records"].append(rec)
+
+        # ── P1: batched control-table write ───────────────────────────────────
+        # Collapse all onboarded records into a handful of set-based MERGE
+        # commits instead of one commit per table (see _upsert_batch). The
+        # reads above ran concurrently; the write is now the only remaining
+        # serialized step, and it's a few commits rather than thousands.
+        if stats["records"]:
+            self._upsert_batch(stats["records"])
         return stats
 
     # ── Per-table logic ───────────────────────────────────────────────────────
@@ -306,8 +314,12 @@ class InventoryManager:
             batch_id          = getattr(self._cfg, "batch_id", "") or "",
         )
 
-        # Upsert to control table
-        self._upsert(rec)
+        # NOTE (P1): the control-table write is intentionally NOT done here
+        # anymore. Per-table MERGE-in-worker-thread meant one Delta commit per
+        # table (serialized behind _write_lock), which crawled at 1000+ tables.
+        # We now return the built record and run_inventory() writes them all in
+        # a few batched MERGE statements via _upsert_batch() after the parallel
+        # read phase completes.
         if rec.size_gb is not None:
             log.info(
                 "Onboarded %s → %s [%s %.2f GB w=%d]",
@@ -623,6 +635,148 @@ class InventoryManager:
         # when touching disjoint rows.
         with self._write_lock:
             self._tgt.execute_ddl(q)
+
+    # ── Column contract shared by _merge_values_row() / _upsert_batch() ────────
+    _MERGE_COLS = (
+        "mid, run_id, clone_type, source_workspace, target_workspace, "
+        "sc, ss, st, target_catalog, target_schema, target_table, source_path, "
+        "size_in_bytes, size_gb, workload_class, workload_weight, max_attempts, "
+        "source_num_files, source_version, bid, status, "
+        "discovered_at, onboarded_at, queued_at, created_at, updated_at"
+    )
+
+    @staticmethod
+    def _merge_values_row(rec: "MigrationRecord") -> str:
+        """One VALUES tuple for a record, column order matching _MERGE_COLS."""
+        size_gb_sql = "NULL" if rec.size_gb is None else f"{rec.size_gb:.6f}"
+        return (
+            "("
+            f"{_sql_str(rec.migration_id)}, {_sql_str(rec.run_id)}, {_sql_str(rec.clone_type)}, "
+            f"{_sql_str(rec.source_workspace)}, {_sql_str(rec.target_workspace)}, "
+            f"{_sql_str(rec.source_catalog)}, {_sql_str(rec.source_schema)}, {_sql_str(rec.source_table)}, "
+            f"{_sql_str(rec.target_catalog)}, {_sql_str(rec.target_schema)}, {_sql_str(rec.target_table)}, "
+            f"{_sql_str(rec.source_path)}, "
+            f"{_sql_num(rec.size_in_bytes)}, {size_gb_sql}, "
+            f"{_sql_str(rec.workload_class)}, {_sql_num(rec.workload_weight)}, {_sql_num(rec.max_attempts)}, "
+            f"{_sql_num(rec.source_num_files)}, {_sql_num(rec.source_version)}, "
+            f"{_sql_str(rec.batch_id)}, {_sql_str(rec.status)}, "
+            f"{_sql_str(rec.discovered_at)}, {_sql_str(rec.onboarded_at)}, {_sql_str(rec.queued_at)}, "
+            f"{_sql_str(rec.created_at)}, {_sql_str(rec.updated_at)}"
+            ")"
+        )
+
+    def _upsert_batch(self, records: "List[MigrationRecord]", batch_size: int = 200) -> None:
+        """
+        P1: batched equivalent of _upsert(). Collapses N per-table MERGE commits
+        into ceil(N / batch_size) set-based MERGE statements — the fix for
+        INVENTORY crawling at 1000+ tables (one Delta commit per table).
+
+        Identical MERGE semantics to _upsert() (same batch_id-scoped identity
+        key, same MATCHED reset of stale state, same NOT MATCHED insert). The
+        source rows are wrapped in an explicit-CAST SELECT so column types are
+        unambiguous even when a whole batch is NULL for a numeric column (e.g.
+        skip_describe_detail runs). A single MERGE can't touch one target row
+        twice, which holds here because each (source_catalog, source_schema,
+        source_table, batch_id) is unique within an inventory run.
+        """
+        if not records:
+            return
+        total = len(records)
+        n_batches = (total + batch_size - 1) // batch_size
+        log.info(
+            "INVENTORY: writing %d record(s) to migration_control in %d batched MERGE(s)",
+            total, n_batches,
+        )
+        for i in range(0, total, batch_size):
+            batch = records[i:i + batch_size]
+            values = ",\n              ".join(self._merge_values_row(r) for r in batch)
+            q = f"""
+        MERGE INTO {self._ctrl} AS t
+        USING (
+          SELECT
+            CAST(mid AS STRING) AS mid, CAST(run_id AS STRING) AS run_id,
+            CAST(clone_type AS STRING) AS clone_type,
+            CAST(source_workspace AS STRING) AS source_workspace,
+            CAST(target_workspace AS STRING) AS target_workspace,
+            CAST(sc AS STRING) AS sc, CAST(ss AS STRING) AS ss, CAST(st AS STRING) AS st,
+            CAST(target_catalog AS STRING) AS target_catalog,
+            CAST(target_schema AS STRING) AS target_schema,
+            CAST(target_table AS STRING) AS target_table,
+            CAST(source_path AS STRING) AS source_path,
+            CAST(size_in_bytes AS BIGINT) AS size_in_bytes,
+            CAST(size_gb AS DOUBLE) AS size_gb,
+            CAST(workload_class AS STRING) AS workload_class,
+            CAST(workload_weight AS INT) AS workload_weight,
+            CAST(max_attempts AS INT) AS max_attempts,
+            CAST(source_num_files AS BIGINT) AS source_num_files,
+            CAST(source_version AS BIGINT) AS source_version,
+            CAST(bid AS STRING) AS bid, CAST(status AS STRING) AS status,
+            CAST(discovered_at AS TIMESTAMP) AS discovered_at,
+            CAST(onboarded_at AS TIMESTAMP) AS onboarded_at,
+            CAST(queued_at AS TIMESTAMP) AS queued_at,
+            CAST(created_at AS TIMESTAMP) AS created_at,
+            CAST(updated_at AS TIMESTAMP) AS updated_at
+          FROM (VALUES
+              {values}
+          ) AS v({self._MERGE_COLS})
+        ) AS s
+        ON t.source_catalog = s.sc AND t.source_schema = s.ss
+           AND t.source_table = s.st AND t.batch_id = s.bid
+        WHEN MATCHED THEN UPDATE SET
+          run_id            = s.run_id,
+          status            = s.status,
+          source_path       = s.source_path,
+          size_in_bytes     = s.size_in_bytes,
+          size_gb           = s.size_gb,
+          workload_class    = s.workload_class,
+          workload_weight   = s.workload_weight,
+          attempt_number    = 0,
+          max_attempts      = s.max_attempts,
+          source_num_files  = s.source_num_files,
+          source_version    = s.source_version,
+          batch_id          = s.bid,
+          target_catalog    = s.target_catalog,
+          target_schema     = s.target_schema,
+          target_table      = s.target_table,
+          started_at        = NULL,
+          completed_at      = NULL,
+          failed_at         = NULL,
+          error_code        = NULL,
+          error_message     = NULL,
+          validation_status = NULL,
+          source_row_count  = NULL,
+          target_row_count  = NULL,
+          onboarded_at      = s.onboarded_at,
+          queued_at         = s.queued_at,
+          updated_at        = s.updated_at
+        WHEN NOT MATCHED THEN INSERT (
+          migration_id, run_id, clone_type,
+          source_workspace, target_workspace,
+          source_catalog, source_schema, source_table,
+          target_catalog, target_schema, target_table,
+          source_path, size_in_bytes, size_gb,
+          workload_class, workload_weight,
+          status, attempt_number, max_attempts,
+          source_num_files, source_version,
+          batch_id,
+          discovered_at, onboarded_at, queued_at,
+          created_at, updated_at
+        ) VALUES (
+          s.mid, s.run_id, s.clone_type,
+          s.source_workspace, s.target_workspace,
+          s.sc, s.ss, s.st,
+          s.target_catalog, s.target_schema, s.target_table,
+          s.source_path, s.size_in_bytes, s.size_gb,
+          s.workload_class, s.workload_weight,
+          s.status, 0, s.max_attempts,
+          s.source_num_files, s.source_version,
+          s.bid,
+          s.discovered_at, s.onboarded_at, s.queued_at,
+          s.created_at, s.updated_at
+        )
+        """
+            with self._write_lock:
+                self._tgt.execute_ddl(q)
 
     def _mark_permanent_failure(self, sel: TableSelection, msg: str) -> None:
         """

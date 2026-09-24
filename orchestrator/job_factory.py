@@ -66,6 +66,11 @@ DEFAULT_PARAMS: Dict[str, Any] = {
     "worker_node_type": "Standard_E32ds_v5",
     "worker_num_workers": "8",
     "instance_pool_id": "0908-093007-hoped4-pool-q4mi8hia",
+    # Chunk-worker clusters ALWAYS provision from this instance pool (pre-warmed
+    # instances avoid on-demand AZURE_QUOTA_EXCEEDED / CLOUD_PROVIDER_RESOURCE_
+    # STOCKOUT failures in eastus). Node type is fixed by the pool itself; leave
+    # blank to fall back to on-demand node_type_id=worker_node_type.
+    "worker_instance_pool_id": "0924-004044-comic1-pool-63p33jj6",
     # warehouses (plain ids, not secrets)
     "target_warehouse_id": "5fe1692f119e2528",
     "source_warehouse_id": "",
@@ -142,11 +147,18 @@ def _worker_cluster_json(p: Dict[str, Any], *, with_spark_conf: bool = True) -> 
     (exactly as the DAB passes it in base_parameters.worker_cluster_json)."""
     spec: Dict[str, Any] = {
         "spark_version": p["worker_spark_version"],
-        "node_type_id": p["worker_node_type"],
-        "azure_attributes": {"availability": "ON_DEMAND_AZURE"},
         "num_workers": int(p["worker_num_workers"]),
         "data_security_mode": "DATA_SECURITY_MODE_AUTO",
     }
+    # Prefer a pre-warmed instance pool for chunk workers (node type is fixed by
+    # the pool; must NOT also set node_type_id/azure_attributes). Fall back to
+    # on-demand provisioning only when no pool id is configured.
+    _wpool = str(p.get("worker_instance_pool_id", "") or "").strip()
+    if _wpool:
+        spec["instance_pool_id"] = _wpool
+    else:
+        spec["node_type_id"] = p["worker_node_type"]
+        spec["azure_attributes"] = {"availability": "ON_DEMAND_AZURE"}
     if with_spark_conf:
         spec["spark_conf"] = {"spark.databricks.delta.preview.enabled": "true"}
     return json.dumps(spec)

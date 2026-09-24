@@ -818,46 +818,62 @@ elif MODE == "VALIDATE":
 
     # Fetch COMPLETED records filtered to this batch (or all if no batch_id)
     records = audit.get_completed_records(batch_id=cfg.batch_id)
-    log.info("Validating %d COMPLETED records for batch=%s", len(records), cfg.batch_id or "ALL")
+    todo = [r for r in records if r.get("validation_status") != "VALIDATED"]
+    log.info(
+        "Validating %d COMPLETED records for batch=%s (%d already VALIDATED, skipped)",
+        len(todo), cfg.batch_id or "ALL", len(records) - len(todo),
+    )
 
     val_pass = val_fail = 0
     rc_checked = rc_matched = rc_mismatched = 0
-    for rec in records:
-        mid = rec["migration_id"]
-        if rec.get("validation_status") == "VALIDATED":
-            log.debug("Skipping already-validated %s", mid[:8])
-            continue
-        try:
-            v_status, v_msg, rc = validator_.validate(rec)
-            if rc.checked:
-                rc_checked += 1
-                if rc.matched is True:
-                    rc_matched += 1
-                elif rc.matched is False:
-                    rc_mismatched += 1
-            if v_status == "VALIDATED":
-                audit.mark_validated(mid, v_msg, rc.source_row_count, rc.target_row_count)
-                val_pass += 1
-            else:
-                audit.mark_validation_failed(mid, v_msg, rc.source_row_count, rc.target_row_count)
+    outcomes = []   # collected results → written in batched statements below
+
+    # P3: validate() is read-only (DESCRIBE DETAIL + COUNT(*)), so run it across
+    # a thread pool instead of one-table-at-a-time. Writes are NOT done here —
+    # they're collapsed into a couple of batched statements after the pool
+    # finishes (mark_validation_batch + record_validation_history_batch).
+    import concurrent.futures as _cf
+    _val_threads = max(1, int(getattr(cfg, "inventory_parallel_threads", 4) or 4))
+    with _cf.ThreadPoolExecutor(max_workers=_val_threads, thread_name_prefix="validate") as _ex:
+        _fut_to_rec = {_ex.submit(validator_.validate, r): r for r in todo}
+        for _fut in _cf.as_completed(_fut_to_rec):
+            rec = _fut_to_rec[_fut]
+            mid = rec["migration_id"]
+            try:
+                v_status, v_msg, rc = _fut.result()
+                if rc.checked:
+                    rc_checked += 1
+                    if rc.matched is True:
+                        rc_matched += 1
+                    elif rc.matched is False:
+                        rc_mismatched += 1
+                if v_status == "VALIDATED":
+                    val_pass += 1
+                else:
+                    val_fail += 1
+                    log.warning("VALIDATION_FAILED %s: %s", mid[:8], v_msg[:120])
+                outcomes.append({
+                    "migration_id": mid, "status": v_status, "message": v_msg,
+                    "source_row_count": rc.source_row_count,
+                    "target_row_count": rc.target_row_count,
+                    "row_count_checked": rc.checked, "row_count_matched": rc.matched,
+                    "record": rec,
+                })
+            except Exception as e:
+                log.error("Validation exception for %s: %s", mid[:8], e)
                 val_fail += 1
-                log.warning("VALIDATION_FAILED %s: %s", mid[:8], v_msg[:120])
-            # Immutable audit trail — one row per VALIDATE attempt, regardless
-            # of pass/fail, so row counts are reviewable historically even
-            # after migration_control's single "latest" row gets overwritten
-            # by a later re-validation.
-            audit.record_validation_history(
-                mid, rec, v_status, v_msg,
-                source_row_count=rc.source_row_count,
-                target_row_count=rc.target_row_count,
-                row_count_checked=rc.checked,
-                row_count_matched=rc.matched,
-            )
-        except Exception as e:
-            log.error("Validation exception for %s: %s", mid[:8], e)
-            audit.mark_validation_failed(mid, f"EXCEPTION: {e}")
-            audit.record_validation_history(mid, rec, "VALIDATION_FAILED", f"EXCEPTION: {e}")
-            val_fail += 1
+                outcomes.append({
+                    "migration_id": mid, "status": "VALIDATION_FAILED",
+                    "message": f"EXCEPTION: {e}",
+                    "source_row_count": None, "target_row_count": None,
+                    "row_count_checked": False, "row_count_matched": None,
+                    "record": rec,
+                })
+
+    # Batched writes: migration_control status + immutable history audit trail.
+    if outcomes:
+        audit.mark_validation_batch(outcomes)
+        audit.record_validation_history_batch(outcomes)
 
     log.info(
         "Validation complete: passed=%d failed=%d | row_count_checked=%d matched=%d mismatched=%d",
@@ -953,6 +969,23 @@ if cfg.cluster_pool:
     for snap in pool.snapshot():
         print(f"  {snap['cluster_id'][:16]} | total={snap['total']} used={snap['used']} free={snap['free']} available={snap['available']}")
 
-# ── Fail job if validation failures exist ──────────────────────────────────────
+# ── Validation failures NO LONGER fail the job ─────────────────────────────────
+# Per operational requirement, VALIDATE never fails the job run itself. A
+# VALIDATION_FAILED table (which is now only produced by a row-count mismatch or
+# a missing source/target — see Validator.validate; a differing sizeInBytes /
+# file count / format is advisory only and does NOT fail validation) is surfaced
+# via logs, the run summary, and the migration_control / migration_validation_history
+# tables for follow-up, but the Databricks job task still completes SUCCESS so
+# downstream tasks and the overall workflow are not blocked.
 if summary.val_failed > 0:
-    raise Exception(f"{summary.val_failed} table(s) failed validation — check migration_control for details")
+    log.warning(
+        "%d table(s) failed validation (row-count mismatch / missing table) — "
+        "job intentionally NOT failed; review migration_control and "
+        "migration_validation_history for details",
+        summary.val_failed,
+    )
+    print(
+        f"\n⚠  {summary.val_failed} table(s) failed validation "
+        f"(row-count mismatch / missing table) — see migration_control for details. "
+        f"Job run left as SUCCESS by design."
+    )

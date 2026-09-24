@@ -67,43 +67,46 @@ from orchestrator.job_factory import (  # noqa: E402
 # should never vary per run (input_type=CSV, auto-generated batch_id, notebook
 # paths, etc.) are abstracted away into ABSTRACTED_DEFAULTS further below.
 
-# Widget labels are numbered 01..21 so the Databricks widget bar (which orders
+# Widget labels are numbered 01..16 so the Databricks widget bar (which orders
 # widgets alphabetically by label) shows them in this exact, logical sequence.
+#
+# NOTE: several knobs are intentionally NOT exposed as widgets — they are fixed
+# for this CSV-mode job creator and live in ABSTRACTED_DEFAULTS below:
+#   • dry_run                   — removed; this notebook always create/updates jobs
+#   • row_count_validation      — derived from validation_enabled (on when validation is on)
+#   • force_reonboard           — fixed "false" (INVENTORY stays idempotent)
+#   • require_target_precreated — fixed "true"  (governance gate ON by default)
+#   • worker_spark_version      — fixed "17.3.x-scala2.13" (17.3 LTS / Spark 4.0 / Scala 2.13)
 
 # ── General ───────────────────────────────────────────────────────────────────
 dbutils.widgets.text("email", "vivek.ravichandiran@databricks.com", "01 · Notification email")
-dbutils.widgets.dropdown("dry_run", "true", ["true", "false"], "02 · Dry run (preview only, no changes)")
 
 # ── Control tables / meta ─────────────────────────────────────────────────────
-dbutils.widgets.text("meta_catalog", "ril_migration_catalog", "03 · Meta catalog (control tables)")
-dbutils.widgets.text("meta_schema", "migration_meta", "04 · Meta schema (control tables)")
+dbutils.widgets.text("meta_catalog", "ril_migration_catalog", "02 · Meta catalog (control tables)")
+dbutils.widgets.text("meta_schema", "migration_meta", "03 · Meta schema (control tables)")
 
 # ── CSV input (the only supported input mode for this job) ────────────────────
-dbutils.widgets.text("csv_path", "", "05 · CSV path (blank = <file_path>/configs/csv_scale_ril_bulk_02_full.csv)")
-dbutils.widgets.text("exclusion_csv_path", "", "06 · Exclusion CSV path (blank = <file_path>/configs/exclusion_list_example.csv)")
+dbutils.widgets.text("csv_path", "", "04 · CSV path (blank = <file_path>/configs/csv_scale_ril_bulk_02_full.csv)")
+dbutils.widgets.text("exclusion_csv_path", "", "05 · Exclusion CSV path (blank = <file_path>/configs/exclusion_list_example.csv)")
 
 # ── Clone behaviour ───────────────────────────────────────────────────────────
-dbutils.widgets.dropdown("clone_type", "delta_share", ["delta_share", "direct_adls"], "07 · Clone type")
-dbutils.widgets.dropdown("validation_enabled", "true", ["true", "false"], "08 · Validation enabled")
-dbutils.widgets.dropdown("row_count_validation", "true", ["true", "false"], "09 · Row-count validation")
-dbutils.widgets.dropdown("force_reonboard", "false", ["true", "false"], "10 · Force re-onboard")
-dbutils.widgets.dropdown("require_target_precreated", "false", ["true", "false"], "11 · Require target pre-created")
+dbutils.widgets.dropdown("clone_type", "delta_share", ["delta_share", "direct_adls"], "06 · Clone type")
+dbutils.widgets.dropdown("validation_enabled", "true", ["true", "false"], "07 · Validation enabled")
 
 # ── Warehouse (plain id, NOT a secret) ───────────────────────────────────────
-dbutils.widgets.text("target_warehouse_id", "5fe1692f119e2528", "12 · Target SQL warehouse id")
+dbutils.widgets.text("target_warehouse_id", "5fe1692f119e2528", "08 · Target SQL warehouse id")
 
 # ── Compute ───────────────────────────────────────────────────────────────────
-dbutils.widgets.text("worker_spark_version", "17.3.x-scala2.13", "13 · Worker Spark version")
-dbutils.widgets.text("worker_node_type", "Standard_E32ds_v5", "14 · Worker node type")
-dbutils.widgets.text("worker_num_workers", "8", "15 · Worker node count")
-dbutils.widgets.text("instance_pool_id", "0908-093007-hoped4-pool-q4mi8hia", "16 · Instance pool id (orchestrator)")
+dbutils.widgets.text("worker_node_type", "Standard_E32ds_v5", "09 · Worker node type")
+dbutils.widgets.text("worker_num_workers", "8", "10 · Worker node count")
+dbutils.widgets.text("instance_pool_id", "0908-093007-hoped4-pool-q4mi8hia", "11 · Instance pool id (orchestrator)")
 
 # ── Chunk execution ───────────────────────────────────────────────────────────
-dbutils.widgets.text("max_concurrent_chunks", "5", "17 · Max concurrent chunks")
-dbutils.widgets.text("parallel_threads", "4", "18 · Parallel threads per chunk")
-dbutils.widgets.text("chunk_capacity_gb", "500", "19 · Chunk capacity (GB)")
-dbutils.widgets.text("min_executors", "8", "20 · Min executors per chunk")
-dbutils.widgets.text("inventory_parallel_threads", "4", "21 · Inventory parallel threads")
+dbutils.widgets.text("max_concurrent_chunks", "5", "12 · Max concurrent chunks")
+dbutils.widgets.text("parallel_threads", "4", "13 · Parallel threads per chunk")
+dbutils.widgets.text("chunk_capacity_gb", "500", "14 · Chunk capacity (GB)")
+dbutils.widgets.text("min_executors", "8", "15 · Min executors per chunk")
+dbutils.widgets.text("inventory_parallel_threads", "4", "16 · Inventory parallel threads")
 
 # COMMAND ----------
 
@@ -129,10 +132,9 @@ except Exception:
 _widget_names = [
     "email", "meta_catalog", "meta_schema",
     "csv_path", "exclusion_csv_path",
-    "clone_type", "validation_enabled", "row_count_validation",
-    "force_reonboard", "require_target_precreated",
+    "clone_type", "validation_enabled",
     "target_warehouse_id",
-    "worker_spark_version", "worker_node_type", "worker_num_workers", "instance_pool_id",
+    "worker_node_type", "worker_num_workers", "instance_pool_id",
     "max_concurrent_chunks", "parallel_threads", "chunk_capacity_gb",
     "min_executors", "inventory_parallel_threads",
 ]
@@ -149,6 +151,11 @@ ABSTRACTED_DEFAULTS = {
     "retry_permanent":      "false",    # opt-in re-drive of FAILED_PERMANENT (off by default)
     "skip_describe_detail": "false",    # always collect full source metadata
     "source_warehouse_id":  "",         # only used by clone_type=direct_adls
+    # ── Fixed knobs (formerly widgets, now hardcoded per request) ─────────────
+    "worker_spark_version":      "17.3.x-scala2.13",  # 17.3 LTS (Spark 4.0.0, Scala 2.13)
+    "force_reonboard":           "false",  # INVENTORY stays idempotent (never re-onboard done tables)
+    "require_target_precreated": "true",   # governance gate ON by default (targets must be pre-provisioned)
+    # row_count_validation is derived from validation_enabled below (not fixed here).
     # JOB-mode-only selection (unused in CSV mode; kept for spec fidelity)
     "target_catalog":        "hive_metastore",
     "source_catalog_filter": '["ril_bulk"]',
@@ -163,16 +170,17 @@ ABSTRACTED_DEFAULTS = {
 
 params = {name: dbutils.widgets.get(name) for name in _widget_names}
 params.update(ABSTRACTED_DEFAULTS)
+# Row-count validation follows validation_enabled: enabled whenever validation
+# itself is enabled, disabled otherwise. (No separate widget — derived here.)
+params["row_count_validation"] = "true" if params["validation_enabled"].lower() == "true" else "false"
 params["workspace_file_path"] = _file_path
 params = resolve_workspace_params(params)   # fills notebook/config paths from file_path
-
-DRY_RUN = dbutils.widgets.get("dry_run").lower() == "true"
 
 print(f"Workspace file root : {params['workspace_file_path']}")
 print(f"Bundle target       : {params['bundle_target']}  (input_type={params['input_type']})")
 print(f"CSV path            : {params['csv_path']}")
 print(f"Orchestrator NB     : {params['orchestrator_notebook']}")
-print(f"Dry run (preview)   : {DRY_RUN}")
+print(f"Row-count validation: {params['row_count_validation']} (follows validation_enabled={params['validation_enabled']})")
 
 # COMMAND ----------
 
@@ -216,18 +224,14 @@ def _find_job_id_by_name(name: str):
 results = []
 for name, settings in specs.items():
     existing_id = _find_job_id_by_name(name)
-    action = "would create" if existing_id is None else "would update"
-    if not DRY_RUN:
-        if existing_id is None:
-            created = w.api_client.do("POST", "/api/2.1/jobs/create", body=settings)
-            job_id = created["job_id"]
-            action = "created"
-        else:
-            w.api_client.do("POST", "/api/2.1/jobs/reset", body=as_reset_body(existing_id, settings))
-            job_id = existing_id
-            action = "updated"
+    if existing_id is None:
+        created = w.api_client.do("POST", "/api/2.1/jobs/create", body=settings)
+        job_id = created["job_id"]
+        action = "created"
     else:
+        w.api_client.do("POST", "/api/2.1/jobs/reset", body=as_reset_body(existing_id, settings))
         job_id = existing_id
+        action = "updated"
     results.append({"job": name, "action": action, "job_id": job_id})
     print(f"[{action:>13}] {name}  (job_id={job_id})")
 
@@ -239,7 +243,7 @@ for name, settings in specs.items():
 # COMMAND ----------
 
 host = w.config.host.rstrip("/")
-print(f"{'DRY RUN — no changes made' if DRY_RUN else 'Jobs synced'}: {len(results)} jobs\n")
+print(f"Jobs synced: {len(results)} jobs\n")
 for r in results:
     link = f"{host}/jobs/{r['job_id']}" if r["job_id"] else "(not yet created)"
     print(f"  {r['action']:>13}  {r['job']}\n                 {link}")

@@ -80,11 +80,15 @@ resources:
               # CLONE directly via Spark on its own cluster and never calls
               # SqlClient/ApiClient, so it has no auth/secrets dependency
               # at all.
+              # Chunk workers ALWAYS use the pre-warmed instance pool
+              # (var.worker_instance_pool_id) — node type is governed by the
+              # pool, so no node_type_id/azure_attributes here. Pre-warmed
+              # instances avoid on-demand Azure capacity failures
+              # (AZURE_QUOTA_EXCEEDED / CLOUD_PROVIDER_RESOURCE_STOCKOUT).
               worker_cluster_json: >
                 {
                   "spark_version": "${var.worker_spark_version}",
-                  "node_type_id": "${var.worker_node_type}",
-                  "azure_attributes": {"availability": "ON_DEMAND_AZURE"},
+                  "instance_pool_id": "${var.worker_instance_pool_id}",
                   "num_workers": ${var.worker_num_workers},
                   "data_security_mode": "DATA_SECURITY_MODE_AUTO",
                   "spark_conf": {"spark.databricks.delta.preview.enabled": "true"}

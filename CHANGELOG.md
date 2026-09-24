@@ -11,6 +11,117 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 > heading (most recent first), with the date and the files touched. Keep entries
 > concise and factual.
 
+## [1.7.0] - 2026-09-24
+
+### Changed
+- **Chunk-worker clusters now ALWAYS provision from a pre-warmed instance pool**
+  (`0924-004044-comic1-pool-63p33jj6`, `Standard_D8ds_v4`, min_idle=25) instead
+  of on-demand VMs. On-demand provisioning in `eastus` was failing at cluster
+  launch with `AZURE_QUOTA_EXCEEDED_EXCEPTION` (E32ds_v5 × 9 = ~288 cores/chunk,
+  over the 350-core regional limit) and, after downsizing, with
+  `CLOUD_PROVIDER_RESOURCE_STOCKOUT` (`Standard_D8ds_v5` SKU not available).
+  Pre-warmed pool instances sidestep both. Node type is now governed by the
+  pool, so `worker_node_type` is ignored while a worker pool id is set.
+  - `orchestrator/job_factory.py`: new `worker_instance_pool_id` param (default
+    is the pool); `_worker_cluster_json` emits `instance_pool_id` (dropping
+    `node_type_id`/`azure_attributes`) when set, and falls back to on-demand
+    `node_type_id` only when blank.
+  - `databricks.yml`: new `worker_instance_pool_id` variable.
+  - `resources/03_deep_clone_job.yml`, `resources/05_retry_job.yml`: chunk
+    `worker_cluster_json` switched to `instance_pool_id: ${var.worker_instance_pool_id}`.
+  - Tests: updated `test_worker_cluster_json_embedded` and added
+    `test_worker_cluster_json_falls_back_to_on_demand_when_no_pool`.
+
+## [1.6.1] - 2026-09-23
+
+### Fixed
+- **INVENTORY batch-planning crash: `[COLUMN_ALIASES_NOT_ALLOWED] ... SQLSTATE:
+  42601`.** The P2 batched chunk-assignment MERGE in
+  `orchestrator/audit_manager.py::assign_batch_chunks` used the
+  `USING (VALUES ...) AS s(mid, cid)` column-alias form, which Databricks
+  rejects directly inside a MERGE `USING` clause. Wrapped the `VALUES` list in a
+  `SELECT ... FROM (VALUES ...) AS v(mid, cid)` subquery (the same safe pattern
+  already used by `mark_validation_batch` and `inventory_manager._upsert_batch`).
+  INVENTORY onboarding itself already succeeded (its `_upsert_batch` was already
+  alias-safe); only the subsequent chunk assignment failed.
+- Tests: added `tests/test_audit_manager_batched_merge_sql.py` — asserts none of
+  the batched MERGEs use the disallowed `(VALUES ...) AS alias(cols)` form,
+  covers batch-splitting and single-quote escaping.
+
+## [1.6.0] - 2026-09-23
+
+### Performance
+- **Eliminated the per-row Delta-commit anti-pattern that stalled runs at 1000+
+  tables.** Several control-table write loops issued one single-row `UPDATE`/
+  `MERGE` (= one Delta commit) per table, which degrades super-linearly on a
+  single table and could take hours for ~1662 tables. All are now batched
+  set-based statements.
+  - **P1 — INVENTORY control-table writes** (`orchestrator/inventory_manager.py`):
+    `_process_one()` no longer writes; `run_inventory()` collects the onboarded
+    records and writes them via new `_upsert_batch()` — a batched `MERGE`
+    (default 200 rows/statement, typed-CAST source SELECT so all-NULL numeric
+    columns still type-check) with identical semantics to `_upsert()`. Reads
+    stay parallel; writes drop from N commits to ceil(N/200).
+  - **P2 — chunk assignment** (`orchestrator/audit_manager.py::assign_batch_chunks`):
+    replaced the per-`migration_id` `UPDATE` loop with batched `MERGE`
+    statements (500 pairs each) — this was the step the 1662-table INVENTORY
+    was visibly stuck on.
+  - **P3 — VALIDATE** (`notebooks/orchestrator_notebook.py` +
+    `orchestrator/audit_manager.py`): `validator.validate()` (read-only) now runs
+    across a `ThreadPoolExecutor`; results are written with two batched calls,
+    `mark_validation_batch()` (batched `MERGE`, `COALESCE`-preserving row counts)
+    and `record_validation_history_batch()` (batched multi-row `INSERT`),
+    instead of ~6 serial SQL round-trips per table.
+  - **P4 — stale reconcile** (`orchestrator/audit_manager.py::reconcile_stale_records`):
+    replaced the `SELECT` + per-row `UPDATE` loop with a single set-based
+    `UPDATE` (plus one `COUNT(*)` for the return value/log).
+  - Tests: updated `tests/test_inventory_manager_skip_describe_detail.py` for the
+    batched write path and added `test_upsert_batch_splits_into_multiple_merges`.
+
+## [1.5.0] - 2026-09-23
+
+### Fixed
+- **Row-count validation false MISMATCH from a stale `source_version`.** The
+  source Delta version was captured at INVENTORY time, but DEEP CLONE reads the
+  source's *live* version at clone time. When a source table received writes
+  during the (potentially long) QUEUED gap between inventory and clone, the
+  target reflected the newer version while VALIDATE still counted the source
+  `VERSION AS OF` the old inventory version — producing a false row-count
+  mismatch (and, since [1.4.0], a `VALIDATION_FAILED`).
+  - `notebooks/chunk_worker_notebook.py`: `clone_table()` now records the source
+    version **actually cloned** and writes it back to
+    `migration_control.source_version` on `COMPLETED`. It reads the source
+    `DESCRIBE HISTORY` immediately before the clone as a fallback, then prefers
+    the exact, race-free `operationParameters.sourceVersion` from the target's
+    CLONE-op history entry. The column is only overwritten when a value is
+    captured (a capture failure never clobbers the inventory value with NULL).
+  - `orchestrator/validator.py`: docstrings updated to reflect that
+    `source_version` is now the clone-time version (the version DEEP CLONE read),
+    not the inventory-time version.
+
+## [1.4.0] - 2026-09-23
+
+### Changed
+- **Validation status is now driven solely by the row-count check.** A table is
+  only marked `VALIDATION_FAILED` when the source/target `COUNT(*)` comparison
+  mismatches (or the source/target table is missing entirely). Size-in-bytes,
+  file-count, target-format, and delta-version checks still run and are recorded
+  in `validation_message` for visibility, but are **advisory only** and no
+  longer fail validation. This fixes tables being flagged `VALIDATION_FAILED`
+  purely because `sizeInBytes` differed (e.g. from post-clone compaction / file
+  layout differences).
+  - `orchestrator/validator.py`: `Validator.validate()` aggregation now returns
+    `VALIDATION_FAILED` only on a row-count mismatch (`row_counts.checked and
+    row_counts.matched is False`); all other checks are informational. Updated
+    module/method docstrings to document the new policy.
+- **VALIDATE never fails the job run.** A `VALIDATION_FAILED` table is surfaced
+  via logs, the run summary, and `migration_control` /
+  `migration_validation_history`, but the Databricks job task now completes
+  `SUCCESS` so downstream tasks and the overall workflow are not blocked.
+  - `notebooks/orchestrator_notebook.py`: replaced the post-VALIDATE
+    `raise Exception(...)` on `summary.val_failed > 0` with a warning log +
+    printed notice; the job is intentionally left `SUCCESS`.
+
 ## [1.3.0] - 2026-09-23
 
 ### Added

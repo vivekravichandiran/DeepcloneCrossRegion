@@ -219,39 +219,36 @@ def test_skip_describe_detail_merge_sql_uses_real_null_literals():
     tgt = FakeSqlClient()
     mgr = InventoryManager(cfg, src, tgt, WorkloadClassifier(cfg), run_id="run-1")
 
-    mgr._process_one(make_selection(), force=False)
+    rec, _ = mgr._process_one(make_selection(), force=False)
+    # P1: _process_one no longer writes — the control-table MERGE is batched and
+    # issued by run_inventory()/_upsert_batch() after the parallel read phase.
+    assert tgt.ddl_calls == [], "_process_one must not write anymore (batched)"
+    mgr._upsert_batch([rec])
 
-    assert len(tgt.ddl_calls) == 1, "expected exactly one MERGE (the _upsert call)"
+    assert len(tgt.ddl_calls) == 1, "expected exactly one batched MERGE"
     merge_sql = tgt.ddl_calls[0]
     # Normalize whitespace so assertions don't depend on exact column
     # alignment/indentation in the SQL-building f-string.
     flat = " ".join(merge_sql.split())
 
-    # Must be MERGE INTO migration_control, and must literally say NULL for
-    # every metadata field that requires DESCRIBE DETAIL to compute (size/
-    # files/version/location) — these are genuinely "never measured".
+    # Must be MERGE INTO migration_control. Unmeasured metadata (size/files/
+    # version/location) is carried as bare SQL NULL in the VALUES row — never
+    # the Python string 'None', and never a quoted 'NULL' string.
     assert "MERGE INTO" in flat
-    assert "size_in_bytes = NULL" in flat
-    assert "size_gb = NULL" in flat
-    assert "source_num_files = NULL" in flat
-    assert "source_version = NULL" in flat
-    assert "source_path = NULL" in flat
-
-    # workload_class/workload_weight are a DELIBERATE exception: they are
-    # NOT left NULL — they're set to the literal sentinel 'UNKNOWN' / 0 (see
-    # WorkloadClass.UNKNOWN in models.py) so that audit queries like
-    # `GROUP BY workload_class` stay meaningful instead of grouping under a
-    # SQL NULL bucket.
-    assert "workload_class = 'UNKNOWN'" in flat
-    assert "workload_weight = 0" in flat
-
-    # Never the Python string "None" leaking into SQL (would be a silent
-    # data-corruption bug — 'None' is a non-NULL string value in the column).
+    assert "NULL" in flat
     assert "'None'" not in flat
     assert "= None" not in flat
+    assert "'NULL'" not in flat
 
-    # The INSERT VALUES branch must also use bare NULL, not a quoted string.
-    assert "'NULL'" not in flat  # must be bare NULL, never quoted
+    # The typed source SELECT casts the numeric columns explicitly so a
+    # whole-batch-NULL column still has an unambiguous type.
+    assert "CAST(size_in_bytes AS BIGINT)" in flat
+    assert "CAST(source_version AS BIGINT)" in flat
+
+    # workload_class/workload_weight are a DELIBERATE exception: they are the
+    # literal sentinel 'UNKNOWN' / 0 (see WorkloadClass.UNKNOWN), present in the
+    # VALUES row so audit `GROUP BY workload_class` stays meaningful.
+    assert "'UNKNOWN'" in flat
 
 
 # ── 4: Regression — skip_describe_detail=False behaves exactly as before ──
@@ -278,19 +275,19 @@ def test_normal_path_still_calls_describe_detail_and_populates_size():
     assert rec.workload_weight == 1
     assert rec.status == MigrationStatus.QUEUED.value
 
+    # P1: write is batched — drive it explicitly and check the VALUES row +
+    # the batched SET (which references the source alias, `col = s.col`).
+    assert tgt.ddl_calls == []
+    mgr._upsert_batch([rec])
     merge_sql = tgt.ddl_calls[0]
     flat = " ".join(merge_sql.split())
-    assert "size_in_bytes = 123456789" in flat
-    assert "size_gb = 0.114978" in flat  # 123456789 bytes, formatted to 6dp
-    assert "workload_class = 'SMALL'" in flat
-    assert "workload_weight = 1" in flat
-    assert "source_num_files = 42" in flat
-    assert "source_version = 7" in flat
-    # No NULLs at all should appear for these populated fields anywhere.
-    for field in ("size_in_bytes", "size_gb", "workload_class", "workload_weight",
-                  "source_num_files", "source_version"):
-        segment = flat.split(f"{field} =")[1].split(",")[0]
-        assert "NULL" not in segment, f"{field} unexpectedly NULL: {segment}"
+    assert "123456789" in flat            # size_in_bytes value present in VALUES row
+    assert "0.114978" in flat             # size_gb formatted to 6dp
+    assert "'SMALL'" in flat
+    assert "size_in_bytes = s.size_in_bytes" in flat   # batched SET references source
+    assert "source_version = s.source_version" in flat
+    # No Python 'None' string ever leaks into SQL for a populated record.
+    assert "'None'" not in flat
 
 
 def test_normal_path_source_not_found_marks_failed_permanent():
@@ -325,10 +322,29 @@ def test_run_inventory_batch_with_skip_describe_detail():
     assert stats["failed"] == 0
     assert stats["skipped"] == 0
     assert src.execute_calls == [], "skip_describe_detail must never touch the source at all"
-    assert len(tgt.ddl_calls) == 3   # one MERGE per table
+    assert len(tgt.ddl_calls) == 1   # P1: all 3 rows in ONE batched MERGE
     for rec in stats["records"]:
         assert rec.size_in_bytes is None
         assert rec.workload_class == WorkloadClass.UNKNOWN.value
+
+
+def test_upsert_batch_splits_into_multiple_merges():
+    """P1: _upsert_batch collapses many records into ceil(N/batch_size) MERGE
+    statements (not one-per-table), and each is a single MERGE INTO."""
+    cfg = make_cfg(skip_describe_detail=True)
+    src = FakeSqlClient()
+    tgt = FakeSqlClient()
+    mgr = InventoryManager(cfg, src, tgt, WorkloadClassifier(cfg), run_id="run-1")
+
+    recs = [mgr._process_one(make_selection(f"t{i}"), force=False)[0] for i in range(250)]
+    assert tgt.ddl_calls == []          # building records writes nothing
+    mgr._upsert_batch(recs, batch_size=200)
+    assert len(tgt.ddl_calls) == 2      # 250 → 200 + 50
+    assert all("MERGE INTO" in c for c in tgt.ddl_calls)
+    # Every record's identity key must appear across the batched statements.
+    joined = " ".join(tgt.ddl_calls)
+    for r in recs:
+        assert f"'{r.source_table}'" in joined
 
 
 def test_run_inventory_idempotent_rerun_same_batch_skips():
@@ -404,12 +420,14 @@ def test_inventory_parallel_threads_reads_run_concurrently():
     )
     # But migration_control MERGE writes must NEVER overlap — that's the
     # entire reason _write_lock exists (avoids Delta concurrent-write
-    # conflicts on the shared control table).
+    # conflicts on the shared control table). With P1 batching the write is a
+    # single set-based MERGE issued after the parallel read phase.
     assert tgt.max_ddl_inflight == 1, (
         f"migration_control writes must be fully serialized, "
         f"got max_ddl_inflight={tgt.max_ddl_inflight}"
     )
-    assert len(tgt.ddl_calls) == N_TABLES  # no writes lost or duplicated
+    assert len(tgt.ddl_calls) == 1          # P1: all N rows in ONE batched MERGE
+    assert len(stats["records"]) == N_TABLES  # no records lost or duplicated
 
 
 def test_inventory_parallel_threads_one_is_fully_sequential():
@@ -429,7 +447,7 @@ def test_inventory_parallel_threads_one_is_fully_sequential():
     assert stats["inserted"] == N_TABLES
     assert src.max_inflight == 1, "inventory_parallel_threads=1 must never overlap source reads"
     assert tgt.max_ddl_inflight == 1
-    assert len(tgt.ddl_calls) == N_TABLES
+    assert len(tgt.ddl_calls) == 1   # P1: single batched MERGE regardless of thread count
 
 
 def test_inventory_parallel_threads_no_lost_or_duplicated_records_under_high_concurrency():
@@ -451,7 +469,8 @@ def test_inventory_parallel_threads_no_lost_or_duplicated_records_under_high_con
     assert stats["skipped"] == 0
     assert len(stats["records"]) == n
     assert len({r.source_table for r in stats["records"]}) == n  # all distinct, none dropped/duplicated
-    assert len(tgt.ddl_calls) == n
+    # P1: n=40 rows fit in a single batched MERGE (batch_size=200).
+    assert len(tgt.ddl_calls) == 1
 
 
 def test_inventory_parallel_threads_zero_or_negative_falls_back_to_one():

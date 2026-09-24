@@ -4,14 +4,24 @@ validator.py — Post-clone source/target comparison.
 Validation is an independent phase (Section 12) that runs separately from
 cloning. This allows large validation jobs to scale independently.
 
+Status policy:
+  The ONLY check that can mark a table VALIDATION_FAILED is the row-count
+  comparison (source vs target COUNT(*) mismatch). All other checks below are
+  still executed and reported in the validation_message for visibility, but are
+  ADVISORY ONLY — a differing sizeInBytes / file count / format / delta version
+  will NOT fail validation. (The one exception is a hard SOURCE_MISSING /
+  TARGET_MISSING, where the table can't be validated at all.)
+
 Checks performed (configurable):
-  ✓ Source exists           — always
-  ✓ Target exists           — always
-  ✓ Format is DELTA         — always
-  ✓ Size comparison         — configurable tolerance %
-  ✓ File count comparison   — configurable tolerance %
-  ✓ Delta version present   — recommended
-  ✓ Row count (COUNT(*))    — optional (expensive for TB-scale tables); counted
+  ✓ Source exists           — always (hard fail if missing)
+  ✓ Target exists           — always (hard fail if missing)
+  ✓ Format is DELTA         — advisory only
+  ✓ Size comparison         — advisory only (configurable tolerance %)
+  ✓ File count comparison   — advisory only (configurable tolerance %)
+  ✓ Delta version present   — advisory only
+  ✓ Row count (COUNT(*))    — optional (expensive for TB-scale tables); the ONLY
+                              check that can flip status to VALIDATION_FAILED;
+                              counted
                               VERSION AS OF the source_version/target_version
                               already captured in migration_control, so it
                               reflects what was actually cloned rather than
@@ -88,6 +98,9 @@ class Validator:
         Returns:
             (status, message, row_counts) where:
               status     = 'VALIDATED' | 'VALIDATION_FAILED'
+                           ('VALIDATION_FAILED' only on a row-count mismatch or a
+                            missing source/target — never on a size/file/format
+                            difference alone)
               row_counts = RowCounts — structured source/target counts (None
                            fields when row_count_validation is disabled or the
                            count query errored), for the caller to persist.
@@ -160,13 +173,16 @@ class Validator:
             f"Target lastCommitTimestamp={tgt_ver}",
         ))
 
-        # 7. Row count (optional) — counted AS OF the exact Delta version captured
-        # in migration_control at inventory/clone time (source_version /
-        # target_version), NOT the live current version. This keeps the
-        # comparison consistent with what was actually cloned, even if the
-        # source table has since received new writes (which would otherwise
-        # produce a false MISMATCH against a target that is intentionally
-        # frozen at clone time).
+        # 7. Row count (optional) — counted AS OF the exact Delta version that
+        # was ACTUALLY cloned (source_version) and the resulting target version
+        # (target_version), both captured in migration_control by the chunk
+        # worker at CLONE time — NOT the live current version. Crucially,
+        # source_version is refreshed at clone time (the version DEEP CLONE read,
+        # taken from the target's CLONE-op sourceVersion), not the stale
+        # inventory-time version. Without that refresh, a source table written
+        # to during the QUEUED gap between inventory and clone would produce a
+        # false MISMATCH: source counted AS OF the old inventory version vs a
+        # target that cloned the newer live version.
         row_counts = RowCounts(
             source_version=record.get("source_version"),
             target_version=record.get("target_version"),
@@ -187,11 +203,24 @@ class Validator:
                 pass
 
         # ── Aggregate ─────────────────────────────────────────────────────────
-        failed = [r for r in results if not r.passed]
-        lines  = [r.to_line() for r in results]
+        # Status policy (per operational requirement): a validation run is only
+        # marked VALIDATION_FAILED when the ROW COUNT comparison fails — i.e.
+        # the source and target row counts don't match. Every other check
+        # (size in bytes, file count, target format, delta version presence) is
+        # still executed and recorded in the message for visibility, but is
+        # ADVISORY ONLY and never fails validation on its own. This means a
+        # benign size/file difference (e.g. from post-clone auto-compaction or
+        # differing file layout) no longer flips a table to VALIDATION_FAILED.
+        #
+        # When row_count_validation is disabled (no count comparison is run),
+        # there is nothing that can "not match", so the run is VALIDATED.
+        # A hard SOURCE_MISSING/TARGET_MISSING is still a failure (handled via
+        # the early returns above) because the table can't be validated at all.
+        lines   = [r.to_line() for r in results]
         message = " | ".join(lines)
 
-        if failed:
+        count_mismatch = row_counts.checked and (row_counts.matched is False)
+        if count_mismatch:
             return "VALIDATION_FAILED", message, row_counts
         return "VALIDATED", message, row_counts
 
@@ -238,8 +267,9 @@ class Validator:
         Optional expensive row-count comparison.
 
         Counted AS OF the specific Delta version recorded in migration_control
-        (source_version at inventory time, target_version right after clone) —
-        NOT the live/current version — so the comparison reflects exactly what
+        (source_version = the version DEEP CLONE actually read, captured by the
+        chunk worker at clone time; target_version = the resulting target commit)
+        — NOT the live/current version — so the comparison reflects exactly what
         was cloned, even if the source table has since been written to again.
         Falls back to a plain (unversioned) COUNT(*) when a version number
         isn't available (e.g. legacy records onboarded before this column

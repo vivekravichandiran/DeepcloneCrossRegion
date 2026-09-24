@@ -8,37 +8,24 @@ resources:
         phase: inventory
 
       parameters:
-        - name: source_catalogs
-          default: ${var.source_catalog_filter}
-        - name: source_schemas
-          default: ${var.source_schema_filter}
-        - name: source_tables
-          default: ${var.source_table_filter}
-        - name: target_catalog
-          default: ${var.target_catalog}
         - name: clone_type
           default: ${var.clone_type}
         - name: meta_catalog
           default: ${var.meta_catalog}
         - name: meta_schema
           default: ${var.meta_schema}
-        # ── Input source parameters ────────────────────────────────────────────
-        # All three values are driven from databricks.yml `variables:` (edit
-        # there, not here, to switch modes for every run/target):
-        #   var.input_type        → CSV / YAML / JOB   (display + JOB-mode fallback)
-        #   var.yaml_config_path  → full path, used when input_type=YAML
-        #   var.csv_path          → full path, used when input_type=CSV
-        # The notebook additionally AUTO-DETECTS the effective mode from which
-        # path is non-blank, so input_type can never drift out of sync with
-        # the path actually being used:
-        #   1. csv_path is non-blank           → CSV  (explicit table list, highest priority)
-        #   2. else yaml_config_path non-blank  → YAML (may itself delegate to a CSV via
-        #                                               migration.csv_path inside that file)
-        #   3. else                             → JOB  (source_catalogs/schemas/tables below)
+        # ── Input source parameters (CSV-oriented) ─────────────────────────────
+        # This job is CSV-first: selection AND target come from the CSV file
+        # itself. The JOB-mode selection inputs (source_catalogs/source_schemas/
+        # source_tables/target_catalog) and the YAML path (yaml_config_path) are
+        # intentionally NOT exposed as job parameters; source_warehouse_id is
+        # likewise omitted (only used for clone_type=direct_adls). selection_type
+        # uses a fixed default hardcoded in base_parameters below.
+        #   var.input_type → CSV / YAML / JOB (display; the notebook auto-detects
+        #                     the effective mode from csv_path being non-blank).
+        #   var.csv_path   → full path to the CSV table-mapping file.
         - name: input_type
           default: ${var.input_type}
-        - name: yaml_config_path
-          default: ${var.yaml_config_path}
         - name: csv_path
           default: ${var.csv_path}
         # exclusion_csv_path: GLOBAL catalog/schema/table exclusion list,
@@ -60,15 +47,13 @@ resources:
           default: "4"         # clone threads within each cluster
         - name: min_executors
           default: ${var.min_executors}   # worker nodes (executors) per chunk cluster
-        # target_warehouse_id / source_warehouse_id: plain (non-secret) SQL
-        # warehouse identifiers — NOT credentials. No client_id/client_secret/
-        # secret-scope anywhere: SqlClient/ApiClient authenticate natively via
-        # databricks.sdk.core.Config(). source_warehouse_id is only consulted
-        # when clone_type=direct_adls.
+        # target_warehouse_id: plain (non-secret) SQL warehouse identifier —
+        # NOT a credential. No client_id/client_secret/secret-scope anywhere:
+        # SqlClient/ApiClient authenticate natively via databricks.sdk.core.
+        # Config(). (source_warehouse_id is omitted — only used for
+        # clone_type=direct_adls, irrelevant to this CSV/delta_share job.)
         - name: target_warehouse_id
           default: ${var.target_warehouse_id}
-        - name: source_warehouse_id
-          default: ${var.source_warehouse_id}
         # force_reonboard: by default INVENTORY is idempotent — it SKIPS any
         # table already COMPLETED/VALIDATED/FAILED_PERMANENT/SKIPPED in
         # migration_control (see InventoryManager docstring), so re-running
@@ -112,14 +97,9 @@ resources:
             base_parameters:
               mode: INVENTORY
               input_type: "{{job.parameters.input_type}}"
-              yaml_config_path: "{{job.parameters.yaml_config_path}}"
               csv_path: "{{job.parameters.csv_path}}"
               exclusion_csv_path: "{{job.parameters.exclusion_csv_path}}"
               selection_type: catalog
-              source_catalogs: "{{job.parameters.source_catalogs}}"
-              source_schemas: "{{job.parameters.source_schemas}}"
-              source_tables: "{{job.parameters.source_tables}}"
-              target_catalog: "{{job.parameters.target_catalog}}"
               clone_type: "{{job.parameters.clone_type}}"
               meta_catalog: "{{job.parameters.meta_catalog}}"
               meta_schema: "{{job.parameters.meta_schema}}"
@@ -133,7 +113,6 @@ resources:
               skip_describe_detail: "{{job.parameters.skip_describe_detail}}"
               inventory_parallel_threads: "{{job.parameters.inventory_parallel_threads}}"
               target_warehouse_id: "{{job.parameters.target_warehouse_id}}"
-              source_warehouse_id: "{{job.parameters.source_warehouse_id}}"
           job_cluster_key: orchestrator_cluster
 
       job_clusters:

@@ -19,8 +19,6 @@ resources:
         # table selection, so CSV/YAML awareness is irrelevant to them.
         - name: input_type
           default: ${var.input_type}
-        - name: yaml_config_path
-          default: ${var.yaml_config_path}
         - name: csv_path
           default: ${var.csv_path}
         # exclusion_csv_path: GLOBAL catalog/schema/table exclusion list,
@@ -31,14 +29,15 @@ resources:
         # logged to migration_exclusion_log for audit. Blank = no exclusions.
         - name: exclusion_csv_path
           default: ${var.exclusion_csv_path}
-        - name: source_catalogs
-          default: ${var.source_catalog_filter}
-        - name: source_schemas
-          default: ${var.source_schema_filter}
-        - name: source_tables
-          default: ${var.source_table_filter}
-        - name: target_catalog
-          default: ${var.target_catalog}
+        # NOTE (CSV-oriented workflow): source_catalogs/source_schemas/
+        # source_tables/target_catalog (JOB-mode selection) and yaml_config_path
+        # (YAML mode) are intentionally NOT exposed as job parameters here —
+        # when input_type=CSV, both selection and target come from the CSV file
+        # itself. source_warehouse_id is likewise omitted (only used for
+        # clone_type=direct_adls). selection_type and worker_notebook_path are
+        # no longer job parameters either — they use fixed defaults hardcoded in
+        # the task base_parameters below (selection_type=catalog,
+        # worker_notebook_path=${var.worker_notebook}).
         - name: clone_type
           default: ${var.clone_type}
         - name: meta_catalog
@@ -57,8 +56,6 @@ resources:
         # attempts them once. Default "false" keeps FAILED_PERMANENT terminal.
         - name: retry_permanent
           default: ${var.retry_permanent}
-        - name: selection_type
-          default: catalog
         - name: run_id
           default: ""
         # ── Batch / Chunk parameters ──────────────────────────────────────────
@@ -72,10 +69,18 @@ resources:
           default: ${var.chunk_capacity_gb}
         - name: min_executors
           default: ${var.min_executors}
+        # ── Chunk-worker compute (overridable at run time) ────────────────────
+        # Back the {{job.parameters.*}} templates in the DEEP_CLONE/RETRY worker
+        # cluster specs below — pool is used when non-blank, else the on-demand
+        # node type (the orchestrator notebook picks exactly one).
         - name: worker_spark_version
           default: ${var.worker_spark_version}
-        - name: worker_notebook_path
-          default: ${var.worker_notebook}   # deployed path to chunk_worker_notebook
+        - name: worker_instance_pool_id
+          default: ${var.worker_instance_pool_id}
+        - name: worker_node_type
+          default: ${var.worker_node_type}
+        - name: worker_num_workers
+          default: "${var.worker_num_workers}"
         # force_reonboard: INVENTORY is idempotent by default and SKIPS tables
         # already COMPLETED/VALIDATED/FAILED_PERMANENT/SKIPPED — see the
         # matching comment in resources/01_inventory_job.yml. Set to "true" to
@@ -99,15 +104,13 @@ resources:
         # set to "1" to fully restore strictly-sequential INVENTORY.
         - name: inventory_parallel_threads
           default: "${var.inventory_parallel_threads}"
-        # target_warehouse_id / source_warehouse_id: plain (non-secret) SQL
-        # warehouse identifiers — NOT credentials. No client_id/client_secret/
-        # secret-scope anywhere: SqlClient/ApiClient authenticate natively via
-        # databricks.sdk.core.Config(). source_warehouse_id is only consulted
-        # when clone_type=direct_adls.
+        # target_warehouse_id: plain (non-secret) SQL warehouse identifier —
+        # NOT a credential. No client_id/client_secret/secret-scope anywhere:
+        # SqlClient/ApiClient authenticate natively via databricks.sdk.core.
+        # Config(). (source_warehouse_id is omitted — only used for
+        # clone_type=direct_adls, irrelevant to this CSV/delta_share workflow.)
         - name: target_warehouse_id
           default: ${var.target_warehouse_id}
-        - name: source_warehouse_id
-          default: ${var.source_warehouse_id}
 
       # ── Tasks ──────────────────────────────────────────────────────────────
       tasks:
@@ -119,14 +122,9 @@ resources:
             base_parameters:
               mode: INVENTORY
               input_type: "{{job.parameters.input_type}}"
-              yaml_config_path: "{{job.parameters.yaml_config_path}}"
               csv_path: "{{job.parameters.csv_path}}"
               exclusion_csv_path: "{{job.parameters.exclusion_csv_path}}"
-              selection_type: "{{job.parameters.selection_type}}"
-              source_catalogs: "{{job.parameters.source_catalogs}}"
-              source_schemas: "{{job.parameters.source_schemas}}"
-              source_tables: "{{job.parameters.source_tables}}"
-              target_catalog: "{{job.parameters.target_catalog}}"
+              selection_type: catalog
               clone_type: "{{job.parameters.clone_type}}"
               meta_catalog: "{{job.parameters.meta_catalog}}"
               meta_schema: "{{job.parameters.meta_schema}}"
@@ -141,7 +139,6 @@ resources:
               skip_describe_detail: "{{job.parameters.skip_describe_detail}}"
               inventory_parallel_threads: "{{job.parameters.inventory_parallel_threads}}"
               target_warehouse_id: "{{job.parameters.target_warehouse_id}}"
-              source_warehouse_id: "{{job.parameters.source_warehouse_id}}"
           job_cluster_key: orchestrator_cluster
 
         # Task 2: DRY_RUN — runs in parallel with INVENTORY for pre-flight report
@@ -152,19 +149,13 @@ resources:
             base_parameters:
               mode: DRY_RUN
               input_type: "{{job.parameters.input_type}}"
-              yaml_config_path: "{{job.parameters.yaml_config_path}}"
               csv_path: "{{job.parameters.csv_path}}"
               exclusion_csv_path: "{{job.parameters.exclusion_csv_path}}"
-              selection_type: "{{job.parameters.selection_type}}"
-              source_catalogs: "{{job.parameters.source_catalogs}}"
-              source_schemas: "{{job.parameters.source_schemas}}"
-              source_tables: "{{job.parameters.source_tables}}"
-              target_catalog: "{{job.parameters.target_catalog}}"
+              selection_type: catalog
               clone_type: "{{job.parameters.clone_type}}"
               meta_catalog: "{{job.parameters.meta_catalog}}"
               meta_schema: "{{job.parameters.meta_schema}}"
               target_warehouse_id: "{{job.parameters.target_warehouse_id}}"
-              source_warehouse_id: "{{job.parameters.source_warehouse_id}}"
           job_cluster_key: orchestrator_cluster
 
         # Task 3: DEEP_CLONE — runs after INVENTORY completes
@@ -196,7 +187,7 @@ resources:
               parallel_threads: "{{job.parameters.parallel_threads}}"
               chunk_capacity_gb: "{{job.parameters.chunk_capacity_gb}}"
               min_executors: "{{job.parameters.min_executors}}"
-              worker_notebook_path: "{{job.parameters.worker_notebook_path}}"
+              worker_notebook_path: ${var.worker_notebook}
               target_warehouse_id: "{{job.parameters.target_warehouse_id}}"
               # No spark_env_vars needed — chunk_worker_notebook.py runs DEEP
               # CLONE directly via Spark on its own cluster and never calls
@@ -205,10 +196,10 @@ resources:
               # instance_pool_id — see resources/03_deep_clone_job.yml).
               worker_cluster_json: >
                 {
-                  "spark_version": "${var.worker_spark_version}",
-                  "node_type_id": "${var.worker_node_type}",
-                  "azure_attributes": {"availability": "ON_DEMAND_AZURE"},
-                  "num_workers": ${var.worker_num_workers},
+                  "spark_version": "{{job.parameters.worker_spark_version}}",
+                  "instance_pool_id": "{{job.parameters.worker_instance_pool_id}}",
+                  "node_type_id": "{{job.parameters.worker_node_type}}",
+                  "num_workers": "{{job.parameters.worker_num_workers}}",
                   "data_security_mode": "DATA_SECURITY_MODE_AUTO",
                   "spark_conf": {"spark.databricks.delta.preview.enabled": "true"}
                 }
@@ -236,15 +227,15 @@ resources:
               max_concurrent_chunks: "{{job.parameters.max_concurrent_chunks}}"
               parallel_threads: "{{job.parameters.parallel_threads}}"
               min_executors: "{{job.parameters.min_executors}}"
-              worker_notebook_path: "{{job.parameters.worker_notebook_path}}"
+              worker_notebook_path: ${var.worker_notebook}
               target_warehouse_id: "{{job.parameters.target_warehouse_id}}"
               # No spark_env_vars needed (see deep_clone task comment above).
               worker_cluster_json: >
                 {
-                  "spark_version": "${var.worker_spark_version}",
-                  "node_type_id": "${var.worker_node_type}",
-                  "azure_attributes": {"availability": "ON_DEMAND_AZURE"},
-                  "num_workers": ${var.worker_num_workers},
+                  "spark_version": "{{job.parameters.worker_spark_version}}",
+                  "instance_pool_id": "{{job.parameters.worker_instance_pool_id}}",
+                  "node_type_id": "{{job.parameters.worker_node_type}}",
+                  "num_workers": "{{job.parameters.worker_num_workers}}",
                   "data_security_mode": "DATA_SECURITY_MODE_AUTO"
                 }
           job_cluster_key: orchestrator_cluster
@@ -268,7 +259,6 @@ resources:
               # See the comment on the deep_clone task above.
               batch_id: "{{tasks.inventory.values.batch_id}}"
               target_warehouse_id: "{{job.parameters.target_warehouse_id}}"
-              source_warehouse_id: "{{job.parameters.source_warehouse_id}}"
           job_cluster_key: orchestrator_cluster
 
       # ── Shared job cluster ─────────────────────────────────────────────────

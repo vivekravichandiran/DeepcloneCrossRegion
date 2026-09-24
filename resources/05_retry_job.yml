@@ -20,8 +20,18 @@ resources:
         # "false" keeps FAILED_PERMANENT terminal (unchanged behaviour).
         - name: retry_permanent
           default: ${var.retry_permanent}
+        # ── Chunk-worker compute (overridable at run time) ────────────────────
+        # Back the {{job.parameters.*}} templates in worker_cluster_json — pool
+        # is used when non-blank, else the on-demand node type (see
+        # resources/03_deep_clone_job.yml).
         - name: worker_spark_version
           default: ${var.worker_spark_version}
+        - name: worker_instance_pool_id
+          default: ${var.worker_instance_pool_id}
+        - name: worker_node_type
+          default: ${var.worker_node_type}
+        - name: worker_num_workers
+          default: "${var.worker_num_workers}"
         - name: batch_id
           default: ""    # retry only this batch; blank = retry ALL
         - name: max_concurrent_chunks
@@ -30,20 +40,16 @@ resources:
           default: "4"
         - name: min_executors
           default: ${var.min_executors}
-        - name: worker_notebook_path
-          default: ${var.worker_notebook}   # deployed path to chunk_worker_notebook
-        # target_warehouse_id / source_warehouse_id: plain (non-secret) SQL
-        # warehouse identifiers — NOT credentials. No client_id/client_secret/
-        # secret-scope anywhere: SqlClient/ApiClient authenticate natively via
-        # databricks.sdk.core.Config().
+        # worker_notebook_path is no longer a job parameter — it uses a fixed
+        # default (${var.worker_notebook}) hardcoded in base_parameters below.
+        # target_warehouse_id: plain (non-secret) SQL warehouse identifier —
+        # NOT a credential. SqlClient/ApiClient authenticate natively via
+        # databricks.sdk.core.Config(). (source_warehouse_id is omitted — only
+        # used for clone_type=direct_adls; RETRY never uses src_sql.)
         - name: target_warehouse_id
           default: ${var.target_warehouse_id}
-        - name: source_warehouse_id
-          default: ${var.source_warehouse_id}
         # clone_type: MUST match whatever clone_type INVENTORY/DEEP_CLONE
-        # actually used for this batch (validate_config() requires
-        # source_warehouse_id non-blank when clone_type=direct_adls) — see
-        # the matching comment in resources/03_deep_clone_job.yml.
+        # actually used for this batch.
         - name: clone_type
           default: ${var.clone_type}
 
@@ -63,9 +69,8 @@ resources:
               max_concurrent_chunks: "{{job.parameters.max_concurrent_chunks}}"
               parallel_threads: "{{job.parameters.parallel_threads}}"
               min_executors: "{{job.parameters.min_executors}}"
-              worker_notebook_path: "{{job.parameters.worker_notebook_path}}"
+              worker_notebook_path: ${var.worker_notebook}
               target_warehouse_id: "{{job.parameters.target_warehouse_id}}"
-              source_warehouse_id: "{{job.parameters.source_warehouse_id}}"
               # No spark_env_vars needed — chunk_worker_notebook.py runs DEEP
               # CLONE directly via Spark on its own cluster and never calls
               # SqlClient/ApiClient, so it has no auth/secrets dependency.
@@ -75,9 +80,10 @@ resources:
               # resources/03_deep_clone_job.yml).
               worker_cluster_json: >
                 {
-                  "spark_version": "${var.worker_spark_version}",
-                  "instance_pool_id": "${var.worker_instance_pool_id}",
-                  "num_workers": ${var.worker_num_workers},
+                  "spark_version": "{{job.parameters.worker_spark_version}}",
+                  "instance_pool_id": "{{job.parameters.worker_instance_pool_id}}",
+                  "node_type_id": "{{job.parameters.worker_node_type}}",
+                  "num_workers": "{{job.parameters.worker_num_workers}}",
                   "data_security_mode": "DATA_SECURITY_MODE_AUTO"
                 }
           job_cluster_key: orchestrator_cluster

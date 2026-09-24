@@ -26,14 +26,13 @@ resources:
           default: ${var.row_count_validation}
         - name: batch_id
           default: ""    # filter validation to this batch only; blank = validate ALL
-        # target_warehouse_id / source_warehouse_id: plain (non-secret) SQL
-        # warehouse identifiers — NOT credentials. No client_id/client_secret/
-        # secret-scope: SqlClient/ApiClient authenticate natively via
-        # databricks.sdk.core.Config().
+        # target_warehouse_id: plain (non-secret) SQL warehouse identifier —
+        # NOT a credential. SqlClient/ApiClient authenticate natively via
+        # databricks.sdk.core.Config(). (source_warehouse_id is omitted — for
+        # delta_share, source tables are validated via tgt_sql on the target
+        # workspace; it is only used for clone_type=direct_adls.)
         - name: target_warehouse_id
           default: ${var.target_warehouse_id}
-        - name: source_warehouse_id
-          default: ${var.source_warehouse_id}
 
       tasks:
         - task_key: validate
@@ -49,7 +48,6 @@ resources:
               row_count_validation: "{{job.parameters.row_count_validation}}"
               batch_id: "{{job.parameters.batch_id}}"
               target_warehouse_id: "{{job.parameters.target_warehouse_id}}"
-              source_warehouse_id: "{{job.parameters.source_warehouse_id}}"
           job_cluster_key: orchestrator_cluster
 
       job_clusters:

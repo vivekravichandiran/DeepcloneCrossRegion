@@ -143,25 +143,38 @@ def _orchestrator_cluster(p: Dict[str, Any], *, key: str = "orchestrator_cluster
 
 
 def _worker_cluster_json(p: Dict[str, Any], *, with_spark_conf: bool = True) -> str:
-    """Ephemeral chunk-worker cluster spec, embedded as a JSON *string* param
-    (exactly as the DAB passes it in base_parameters.worker_cluster_json)."""
+    """Ephemeral chunk-worker cluster spec, embedded as a JSON *string* param.
+
+    The compute knobs are RUNTIME job-parameter templates ({{job.parameters.*}})
+    so the chunk-worker pool, node type, worker count and Spark version can be
+    overridden at run time from the Jobs 'Run now' panel — not frozen at job-
+    creation time. Both instance_pool_id and node_type_id are emitted; the
+    orchestrator notebook normalizes them at dispatch (uses the pool when
+    worker_instance_pool_id is non-blank, else the on-demand node type), because
+    Databricks rejects a cluster spec that sets both.
+    """
     spec: Dict[str, Any] = {
-        "spark_version": p["worker_spark_version"],
-        "num_workers": int(p["worker_num_workers"]),
+        "spark_version": "{{job.parameters.worker_spark_version}}",
+        "instance_pool_id": "{{job.parameters.worker_instance_pool_id}}",
+        "node_type_id": "{{job.parameters.worker_node_type}}",
+        "num_workers": "{{job.parameters.worker_num_workers}}",
         "data_security_mode": "DATA_SECURITY_MODE_AUTO",
     }
-    # Prefer a pre-warmed instance pool for chunk workers (node type is fixed by
-    # the pool; must NOT also set node_type_id/azure_attributes). Fall back to
-    # on-demand provisioning only when no pool id is configured.
-    _wpool = str(p.get("worker_instance_pool_id", "") or "").strip()
-    if _wpool:
-        spec["instance_pool_id"] = _wpool
-    else:
-        spec["node_type_id"] = p["worker_node_type"]
-        spec["azure_attributes"] = {"availability": "ON_DEMAND_AZURE"}
     if with_spark_conf:
         spec["spark_conf"] = {"spark.databricks.delta.preview.enabled": "true"}
     return json.dumps(spec)
+
+
+# Chunk-worker compute job parameters shared by DEEP_CLONE, RETRY and the full
+# workflow — these back the {{job.parameters.*}} templates in the worker cluster
+# spec, making the pool / node type / worker count overridable at run time.
+def _worker_compute_params(p: Dict[str, Any]) -> List[tuple]:
+    return [
+        ("worker_spark_version", p["worker_spark_version"]),
+        ("worker_instance_pool_id", p["worker_instance_pool_id"]),
+        ("worker_node_type", p["worker_node_type"]),
+        ("worker_num_workers", p["worker_num_workers"]),
+    ]
 
 
 def _emails(p: Dict[str, Any], *, on_success: bool = False) -> Dict[str, Any]:
@@ -202,16 +215,14 @@ def build_inventory_job(p: Dict[str, Any]) -> Dict[str, Any]:
         "name": _job_name("DeepClone 1 - INVENTORY", p["bundle_target"]),
         "description": "Discovers and onboards source tables into migration_control (QUEUED status).",
         "tags": {"team": _TAGS_TEAM, "phase": "inventory"},
+        # CSV-oriented (see build_full_workflow_job): selection + target come
+        # from the CSV, so source_catalogs/schemas/tables, target_catalog,
+        # yaml_config_path and source_warehouse_id are NOT exposed.
         "parameters": _param_list([
-            ("source_catalogs", p["source_catalog_filter"]),
-            ("source_schemas", p["source_schema_filter"]),
-            ("source_tables", p["source_table_filter"]),
-            ("target_catalog", p["target_catalog"]),
             ("clone_type", p["clone_type"]),
             ("meta_catalog", p["meta_catalog"]),
             ("meta_schema", p["meta_schema"]),
             ("input_type", p["input_type"]),
-            ("yaml_config_path", p["yaml_config_path"]),
             ("csv_path", p["csv_path"]),
             ("exclusion_csv_path", p["exclusion_csv_path"]),
             ("batch_id", ""),
@@ -220,7 +231,6 @@ def build_inventory_job(p: Dict[str, Any]) -> Dict[str, Any]:
             ("parallel_threads", "4"),
             ("min_executors", p["min_executors"]),
             ("target_warehouse_id", p["target_warehouse_id"]),
-            ("source_warehouse_id", p["source_warehouse_id"]),
             ("force_reonboard", p["force_reonboard"]),
             ("require_target_precreated", p["require_target_precreated"]),
             ("skip_describe_detail", p["skip_describe_detail"]),
@@ -233,14 +243,9 @@ def build_inventory_job(p: Dict[str, Any]) -> Dict[str, Any]:
                 "base_parameters": {
                     "mode": "INVENTORY",
                     "input_type": "{{job.parameters.input_type}}",
-                    "yaml_config_path": "{{job.parameters.yaml_config_path}}",
                     "csv_path": "{{job.parameters.csv_path}}",
                     "exclusion_csv_path": "{{job.parameters.exclusion_csv_path}}",
                     "selection_type": "catalog",
-                    "source_catalogs": "{{job.parameters.source_catalogs}}",
-                    "source_schemas": "{{job.parameters.source_schemas}}",
-                    "source_tables": "{{job.parameters.source_tables}}",
-                    "target_catalog": "{{job.parameters.target_catalog}}",
                     "clone_type": "{{job.parameters.clone_type}}",
                     "meta_catalog": "{{job.parameters.meta_catalog}}",
                     "meta_schema": "{{job.parameters.meta_schema}}",
@@ -254,7 +259,6 @@ def build_inventory_job(p: Dict[str, Any]) -> Dict[str, Any]:
                     "skip_describe_detail": "{{job.parameters.skip_describe_detail}}",
                     "inventory_parallel_threads": "{{job.parameters.inventory_parallel_threads}}",
                     "target_warehouse_id": "{{job.parameters.target_warehouse_id}}",
-                    "source_warehouse_id": "{{job.parameters.source_warehouse_id}}",
                 },
             },
             "job_cluster_key": "orchestrator_cluster",
@@ -269,17 +273,18 @@ def build_dry_run_job(p: Dict[str, Any]) -> Dict[str, Any]:
         "name": _job_name("DeepClone 2 - DRY_RUN", p["bundle_target"]),
         "description": "Resolves table scope and prints execution plan — no data is moved.",
         "tags": {"team": _TAGS_TEAM, "phase": "dry_run"},
+        # CSV-oriented (mirrors the workflow's dry_run): selection comes from
+        # the CSV via input_type/csv_path — no JOB-mode source_catalogs/schemas/
+        # tables/target_catalog/source_warehouse_id. selection_type is a fixed
+        # default hardcoded in base_parameters below.
         "parameters": _param_list([
-            ("source_catalogs", p["source_catalog_filter"]),
-            ("source_schemas", p["source_schema_filter"]),
-            ("source_tables", p["source_table_filter"]),
-            ("target_catalog", p["target_catalog"]),
+            ("input_type", p["input_type"]),
+            ("csv_path", p["csv_path"]),
+            ("exclusion_csv_path", p["exclusion_csv_path"]),
             ("clone_type", p["clone_type"]),
             ("meta_catalog", p["meta_catalog"]),
             ("meta_schema", p["meta_schema"]),
-            ("selection_type", "catalog"),
             ("target_warehouse_id", p["target_warehouse_id"]),
-            ("source_warehouse_id", p["source_warehouse_id"]),
         ]),
         "tasks": [{
             "task_key": "dry_run",
@@ -287,17 +292,14 @@ def build_dry_run_job(p: Dict[str, Any]) -> Dict[str, Any]:
                 "notebook_path": p["orchestrator_notebook"],
                 "base_parameters": {
                     "mode": "DRY_RUN",
-                    "input_type": "JOB",
-                    "selection_type": "{{job.parameters.selection_type}}",
-                    "source_catalogs": "{{job.parameters.source_catalogs}}",
-                    "source_schemas": "{{job.parameters.source_schemas}}",
-                    "source_tables": "{{job.parameters.source_tables}}",
-                    "target_catalog": "{{job.parameters.target_catalog}}",
+                    "input_type": "{{job.parameters.input_type}}",
+                    "csv_path": "{{job.parameters.csv_path}}",
+                    "exclusion_csv_path": "{{job.parameters.exclusion_csv_path}}",
+                    "selection_type": "catalog",
                     "clone_type": "{{job.parameters.clone_type}}",
                     "meta_catalog": "{{job.parameters.meta_catalog}}",
                     "meta_schema": "{{job.parameters.meta_schema}}",
                     "target_warehouse_id": "{{job.parameters.target_warehouse_id}}",
-                    "source_warehouse_id": "{{job.parameters.source_warehouse_id}}",
                 },
             },
             "job_cluster_key": "orchestrator_cluster",
@@ -318,15 +320,13 @@ def build_deep_clone_job(p: Dict[str, Any]) -> Dict[str, Any]:
             ("validation_enabled", p["validation_enabled"]),
             ("row_count_validation", p["row_count_validation"]),
             ("max_retries", p["max_retries"]),
-            ("worker_spark_version", p["worker_spark_version"]),
+            *_worker_compute_params(p),
             ("batch_id", ""),
             ("max_concurrent_chunks", p["max_concurrent_chunks"]),
             ("parallel_threads", "4"),
             ("chunk_capacity_gb", "50"),
             ("min_executors", p["min_executors"]),
-            ("worker_notebook_path", p["worker_notebook"]),
             ("target_warehouse_id", p["target_warehouse_id"]),
-            ("source_warehouse_id", p["source_warehouse_id"]),
             ("clone_type", p["clone_type"]),
         ]),
         "tasks": [{
@@ -347,9 +347,8 @@ def build_deep_clone_job(p: Dict[str, Any]) -> Dict[str, Any]:
                     "parallel_threads": "{{job.parameters.parallel_threads}}",
                     "chunk_capacity_gb": "{{job.parameters.chunk_capacity_gb}}",
                     "min_executors": "{{job.parameters.min_executors}}",
-                    "worker_notebook_path": "{{job.parameters.worker_notebook_path}}",
+                    "worker_notebook_path": p["worker_notebook"],
                     "target_warehouse_id": "{{job.parameters.target_warehouse_id}}",
-                    "source_warehouse_id": "{{job.parameters.source_warehouse_id}}",
                     "worker_cluster_json": _worker_cluster_json(p),
                 },
             },
@@ -372,7 +371,6 @@ def build_validate_job(p: Dict[str, Any]) -> Dict[str, Any]:
             ("row_count_validation", p["row_count_validation"]),
             ("batch_id", ""),
             ("target_warehouse_id", p["target_warehouse_id"]),
-            ("source_warehouse_id", p["source_warehouse_id"]),
         ]),
         "tasks": [{
             "task_key": "validate",
@@ -388,7 +386,6 @@ def build_validate_job(p: Dict[str, Any]) -> Dict[str, Any]:
                     "row_count_validation": "{{job.parameters.row_count_validation}}",
                     "batch_id": "{{job.parameters.batch_id}}",
                     "target_warehouse_id": "{{job.parameters.target_warehouse_id}}",
-                    "source_warehouse_id": "{{job.parameters.source_warehouse_id}}",
                 },
             },
             "job_cluster_key": "orchestrator_cluster",
@@ -408,14 +405,12 @@ def build_retry_job(p: Dict[str, Any]) -> Dict[str, Any]:
             ("meta_schema", p["meta_schema"]),
             ("max_retries", p["max_retries"]),
             ("retry_permanent", p["retry_permanent"]),
-            ("worker_spark_version", p["worker_spark_version"]),
+            *_worker_compute_params(p),
             ("batch_id", ""),
             ("max_concurrent_chunks", p["max_concurrent_chunks"]),
             ("parallel_threads", "4"),
             ("min_executors", p["min_executors"]),
-            ("worker_notebook_path", p["worker_notebook"]),
             ("target_warehouse_id", p["target_warehouse_id"]),
-            ("source_warehouse_id", p["source_warehouse_id"]),
             ("clone_type", p["clone_type"]),
         ]),
         "tasks": [{
@@ -434,9 +429,8 @@ def build_retry_job(p: Dict[str, Any]) -> Dict[str, Any]:
                     "max_concurrent_chunks": "{{job.parameters.max_concurrent_chunks}}",
                     "parallel_threads": "{{job.parameters.parallel_threads}}",
                     "min_executors": "{{job.parameters.min_executors}}",
-                    "worker_notebook_path": "{{job.parameters.worker_notebook_path}}",
+                    "worker_notebook_path": p["worker_notebook"],
                     "target_warehouse_id": "{{job.parameters.target_warehouse_id}}",
-                    "source_warehouse_id": "{{job.parameters.source_warehouse_id}}",
                     "worker_cluster_json": _worker_cluster_json(p, with_spark_conf=False),
                 },
             },
@@ -457,15 +451,19 @@ def build_full_workflow_job(p: Dict[str, Any]) -> Dict[str, Any]:
             "VALIDATE -> RETRY (if needed). All tasks parameterized and modular."
         ),
         "tags": {"team": _TAGS_TEAM, "phase": "full_workflow"},
+        # CSV-oriented workflow. The following are intentionally NOT exposed as
+        # job parameters (they are irrelevant when input_type=CSV — selection and
+        # target come from the CSV file itself): source_catalogs/source_schemas/
+        # source_tables/target_catalog (JOB-mode selection), yaml_config_path
+        # (YAML mode), and source_warehouse_id (only used for clone_type=
+        # direct_adls). selection_type and worker_notebook_path are also no
+        # longer job parameters — they use fixed defaults hardcoded in the task
+        # base_parameters below (selection_type="catalog", worker_notebook_path=
+        # the deployed chunk_worker_notebook path).
         "parameters": _param_list([
             ("input_type", p["input_type"]),
-            ("yaml_config_path", p["yaml_config_path"]),
             ("csv_path", p["csv_path"]),
             ("exclusion_csv_path", p["exclusion_csv_path"]),
-            ("source_catalogs", p["source_catalog_filter"]),
-            ("source_schemas", p["source_schema_filter"]),
-            ("source_tables", p["source_table_filter"]),
-            ("target_catalog", p["target_catalog"]),
             ("clone_type", p["clone_type"]),
             ("meta_catalog", p["meta_catalog"]),
             ("meta_schema", p["meta_schema"]),
@@ -473,21 +471,18 @@ def build_full_workflow_job(p: Dict[str, Any]) -> Dict[str, Any]:
             ("row_count_validation", p["row_count_validation"]),
             ("max_retries", p["max_retries"]),
             ("retry_permanent", p["retry_permanent"]),
-            ("selection_type", "catalog"),
             ("run_id", ""),
             ("batch_id", p["batch_id"]),
             ("max_concurrent_chunks", p["max_concurrent_chunks"]),
             ("parallel_threads", p["parallel_threads"]),
             ("chunk_capacity_gb", p["chunk_capacity_gb"]),
             ("min_executors", p["min_executors"]),
-            ("worker_spark_version", p["worker_spark_version"]),
-            ("worker_notebook_path", p["worker_notebook"]),
+            *_worker_compute_params(p),
             ("force_reonboard", p["force_reonboard"]),
             ("require_target_precreated", p["require_target_precreated"]),
             ("skip_describe_detail", p["skip_describe_detail"]),
             ("inventory_parallel_threads", p["inventory_parallel_threads"]),
             ("target_warehouse_id", p["target_warehouse_id"]),
-            ("source_warehouse_id", p["source_warehouse_id"]),
         ]),
         "tasks": [
             {
@@ -498,14 +493,9 @@ def build_full_workflow_job(p: Dict[str, Any]) -> Dict[str, Any]:
                     "base_parameters": {
                         "mode": "INVENTORY",
                         "input_type": "{{job.parameters.input_type}}",
-                        "yaml_config_path": "{{job.parameters.yaml_config_path}}",
                         "csv_path": "{{job.parameters.csv_path}}",
                         "exclusion_csv_path": "{{job.parameters.exclusion_csv_path}}",
-                        "selection_type": "{{job.parameters.selection_type}}",
-                        "source_catalogs": "{{job.parameters.source_catalogs}}",
-                        "source_schemas": "{{job.parameters.source_schemas}}",
-                        "source_tables": "{{job.parameters.source_tables}}",
-                        "target_catalog": "{{job.parameters.target_catalog}}",
+                        "selection_type": "catalog",
                         "clone_type": "{{job.parameters.clone_type}}",
                         "meta_catalog": "{{job.parameters.meta_catalog}}",
                         "meta_schema": "{{job.parameters.meta_schema}}",
@@ -520,7 +510,6 @@ def build_full_workflow_job(p: Dict[str, Any]) -> Dict[str, Any]:
                         "skip_describe_detail": "{{job.parameters.skip_describe_detail}}",
                         "inventory_parallel_threads": "{{job.parameters.inventory_parallel_threads}}",
                         "target_warehouse_id": "{{job.parameters.target_warehouse_id}}",
-                        "source_warehouse_id": "{{job.parameters.source_warehouse_id}}",
                     },
                 },
                 "job_cluster_key": "orchestrator_cluster",
@@ -533,19 +522,13 @@ def build_full_workflow_job(p: Dict[str, Any]) -> Dict[str, Any]:
                     "base_parameters": {
                         "mode": "DRY_RUN",
                         "input_type": "{{job.parameters.input_type}}",
-                        "yaml_config_path": "{{job.parameters.yaml_config_path}}",
                         "csv_path": "{{job.parameters.csv_path}}",
                         "exclusion_csv_path": "{{job.parameters.exclusion_csv_path}}",
-                        "selection_type": "{{job.parameters.selection_type}}",
-                        "source_catalogs": "{{job.parameters.source_catalogs}}",
-                        "source_schemas": "{{job.parameters.source_schemas}}",
-                        "source_tables": "{{job.parameters.source_tables}}",
-                        "target_catalog": "{{job.parameters.target_catalog}}",
+                        "selection_type": "catalog",
                         "clone_type": "{{job.parameters.clone_type}}",
                         "meta_catalog": "{{job.parameters.meta_catalog}}",
                         "meta_schema": "{{job.parameters.meta_schema}}",
                         "target_warehouse_id": "{{job.parameters.target_warehouse_id}}",
-                        "source_warehouse_id": "{{job.parameters.source_warehouse_id}}",
                     },
                 },
                 "job_cluster_key": "orchestrator_cluster",
@@ -571,7 +554,7 @@ def build_full_workflow_job(p: Dict[str, Any]) -> Dict[str, Any]:
                         "parallel_threads": "{{job.parameters.parallel_threads}}",
                         "chunk_capacity_gb": "{{job.parameters.chunk_capacity_gb}}",
                         "min_executors": "{{job.parameters.min_executors}}",
-                        "worker_notebook_path": "{{job.parameters.worker_notebook_path}}",
+                        "worker_notebook_path": p["worker_notebook"],
                         "target_warehouse_id": "{{job.parameters.target_warehouse_id}}",
                         "worker_cluster_json": dc_worker,
                     },
@@ -596,7 +579,7 @@ def build_full_workflow_job(p: Dict[str, Any]) -> Dict[str, Any]:
                         "max_concurrent_chunks": "{{job.parameters.max_concurrent_chunks}}",
                         "parallel_threads": "{{job.parameters.parallel_threads}}",
                         "min_executors": "{{job.parameters.min_executors}}",
-                        "worker_notebook_path": "{{job.parameters.worker_notebook_path}}",
+                        "worker_notebook_path": p["worker_notebook"],
                         "target_warehouse_id": "{{job.parameters.target_warehouse_id}}",
                         "worker_cluster_json": retry_worker,
                     },
@@ -620,7 +603,6 @@ def build_full_workflow_job(p: Dict[str, Any]) -> Dict[str, Any]:
                         "run_id": "{{job.parameters.run_id}}",
                         "batch_id": "{{tasks.inventory.values.batch_id}}",
                         "target_warehouse_id": "{{job.parameters.target_warehouse_id}}",
-                        "source_warehouse_id": "{{job.parameters.source_warehouse_id}}",
                     },
                 },
                 "job_cluster_key": "orchestrator_cluster",

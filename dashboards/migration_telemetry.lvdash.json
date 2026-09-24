@@ -1,0 +1,2021 @@
+{
+  "datasets": [
+    {
+      "name": "ds_control",
+      "displayName": "ds_control",
+      "queryLines": [
+        "SELECT *,\n",
+        "          CASE WHEN source_row_count IS NULL OR target_row_count IS NULL THEN 'NOT CHECKED'\n",
+        "               WHEN source_row_count = target_row_count THEN 'MATCH'\n",
+        "               ELSE 'MISMATCH' END AS row_count_status\n",
+        "        FROM ril_migration_catalog.migration_meta.migration_control\n"
+      ]
+    },
+    {
+      "name": "ds_kpis",
+      "displayName": "ds_kpis",
+      "queryLines": [
+        "SELECT\n",
+        "          COUNT(*) AS total_tables,\n",
+        "          SUM(CASE WHEN status IN ('COMPLETED','VALIDATED')   THEN 1 ELSE 0 END) AS done_tables,\n",
+        "          SUM(CASE WHEN status IN ('ASSIGNED','IN_PROGRESS') THEN 1 ELSE 0 END) AS active_tables,\n",
+        "          SUM(CASE WHEN status = 'QUEUED'  THEN 1 ELSE 0 END) AS queued_tables,\n",
+        "          SUM(CASE WHEN status IN ('FAILED','FAILED_PERMANENT','VALIDATION_FAILED') THEN 1 ELSE 0 END) AS failed_tables,\n",
+        "          ROUND(100.0 * SUM(CASE WHEN status IN ('COMPLETED','VALIDATED') THEN 1 ELSE 0 END)\n",
+        "                / NULLIF(COUNT(*),0), 1) AS pct_complete,\n",
+        "          ROUND(COALESCE(SUM(size_gb),0),2) AS total_gb,\n",
+        "          ROUND(COALESCE(SUM(CASE WHEN status IN ('COMPLETED','VALIDATED') THEN size_gb ELSE 0 END),0),2) AS gb_done\n",
+        "        FROM ril_migration_catalog.migration_meta.migration_control\n"
+      ]
+    },
+    {
+      "name": "ds_cumulative",
+      "displayName": "ds_cumulative",
+      "queryLines": [
+        "WITH h AS (\n",
+        "          SELECT DATE_TRUNC('HOUR', completed_at) AS hour, COUNT(*) AS n\n",
+        "          FROM ril_migration_catalog.migration_meta.migration_control\n",
+        "          WHERE status IN ('COMPLETED','VALIDATED') AND completed_at IS NOT NULL\n",
+        "          GROUP BY 1)\n",
+        "        SELECT hour, SUM(n) OVER (ORDER BY hour) AS cumulative_done\n",
+        "        FROM h ORDER BY hour\n"
+      ]
+    },
+    {
+      "name": "ds_throughput",
+      "displayName": "ds_throughput",
+      "queryLines": [
+        "SELECT DATE_TRUNC('HOUR', completed_at) AS hour,\n",
+        "               COUNT(*) AS tables_done,\n",
+        "               ROUND(SUM(size_gb),2) AS gb_done,\n",
+        "               ROUND(AVG(duration_seconds),1) AS avg_duration_s\n",
+        "        FROM ril_migration_catalog.migration_meta.migration_control\n",
+        "        WHERE status IN ('COMPLETED','VALIDATED') AND completed_at IS NOT NULL\n",
+        "        GROUP BY 1 ORDER BY 1\n"
+      ]
+    },
+    {
+      "name": "ds_failcodes",
+      "displayName": "ds_failcodes",
+      "queryLines": [
+        "SELECT COALESCE(error_code,'(none)') AS error_code, COUNT(*) AS n\n",
+        "        FROM ril_migration_catalog.migration_meta.migration_control WHERE status IN ('FAILED','FAILED_PERMANENT','VALIDATION_FAILED')\n",
+        "        GROUP BY 1 ORDER BY n DESC\n"
+      ]
+    },
+    {
+      "name": "ds_failures",
+      "displayName": "ds_failures",
+      "queryLines": [
+        "SELECT source_catalog, source_schema, source_table, status, error_code,\n",
+        "               error_message, attempt_number, max_attempts, batch_id, updated_at\n",
+        "        FROM ril_migration_catalog.migration_meta.migration_control WHERE status IN ('FAILED','FAILED_PERMANENT','VALIDATION_FAILED')\n",
+        "        ORDER BY updated_at DESC LIMIT 500\n"
+      ]
+    },
+    {
+      "name": "ds_attempts_daily",
+      "displayName": "ds_attempts_daily",
+      "queryLines": [
+        "SELECT DATE(created_at) AS day, COALESCE(status,'(unknown)') AS status, COUNT(*) AS n\n",
+        "        FROM ril_migration_catalog.migration_meta.migration_attempts GROUP BY 1,2 ORDER BY 1\n"
+      ]
+    },
+    {
+      "name": "ds_valhist_daily",
+      "displayName": "ds_valhist_daily",
+      "queryLines": [
+        "SELECT DATE(validated_at) AS day, COALESCE(status,'(unknown)') AS status, COUNT(*) AS n\n",
+        "        FROM ril_migration_catalog.migration_meta.migration_validation_history GROUP BY 1,2 ORDER BY 1\n"
+      ]
+    },
+    {
+      "name": "ds_mismatch",
+      "displayName": "ds_mismatch",
+      "queryLines": [
+        "SELECT source_schema, source_table, target_schema, target_table,\n",
+        "               source_version, target_version, source_row_count, target_row_count,\n",
+        "               validation_status, updated_at\n",
+        "        FROM ril_migration_catalog.migration_meta.migration_control\n",
+        "        WHERE source_row_count IS NOT NULL AND target_row_count IS NOT NULL\n",
+        "          AND source_row_count <> target_row_count\n",
+        "        ORDER BY updated_at DESC LIMIT 500\n"
+      ]
+    },
+    {
+      "name": "ds_longest",
+      "displayName": "ds_longest",
+      "queryLines": [
+        "SELECT source_schema, source_table, target_schema, target_table,\n",
+        "               ROUND(size_gb,2) AS size_gb, duration_seconds, batch_id, status\n",
+        "        FROM ril_migration_catalog.migration_meta.migration_control WHERE duration_seconds IS NOT NULL\n",
+        "        ORDER BY duration_seconds DESC LIMIT 50\n"
+      ]
+    },
+    {
+      "name": "ds_chunks",
+      "displayName": "ds_chunks",
+      "queryLines": [
+        "SELECT batch_id, chunk_id, COUNT(*) AS tables, ROUND(SUM(size_gb),2) AS gb,\n",
+        "               SUM(CASE WHEN status IN ('COMPLETED','VALIDATED') THEN 1 ELSE 0 END) AS done\n",
+        "        FROM ril_migration_catalog.migration_meta.migration_control WHERE chunk_id IS NOT NULL\n",
+        "        GROUP BY batch_id, chunk_id ORDER BY batch_id, chunk_id\n"
+      ]
+    },
+    {
+      "name": "ds_excl",
+      "displayName": "ds_excl",
+      "queryLines": [
+        "SELECT run_id, batch_id, source_catalog, source_schema, source_table,\n",
+        "               exclusion_type, exclusion_rule, excluded_at\n",
+        "        FROM ril_migration_catalog.migration_meta.migration_exclusion_log ORDER BY excluded_at DESC LIMIT 1000\n"
+      ]
+    }
+  ],
+  "pages": [
+    {
+      "name": "overview",
+      "displayName": "Overview",
+      "layout": [
+        {
+          "widget": {
+            "name": "dfe7581f",
+            "queries": [
+              {
+                "name": "q_f32cef55",
+                "query": {
+                  "datasetName": "ds_control",
+                  "fields": [
+                    {
+                      "name": "batch_id",
+                      "expression": "`batch_id`"
+                    },
+                    {
+                      "name": "batch_id_associativity",
+                      "expression": "COUNT_IF(`associative_filter_predicate_group`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "filter-multi-select",
+              "encodings": {
+                "fields": [
+                  {
+                    "fieldName": "batch_id",
+                    "displayName": "Batch",
+                    "queryName": "q_f32cef55"
+                  }
+                ]
+              },
+              "frame": {
+                "title": "Batch",
+                "showTitle": true
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 0,
+            "width": 2,
+            "height": 2
+          }
+        },
+        {
+          "widget": {
+            "name": "eb51a37d",
+            "queries": [
+              {
+                "name": "q_d4aa8d74",
+                "query": {
+                  "datasetName": "ds_control",
+                  "fields": [
+                    {
+                      "name": "status",
+                      "expression": "`status`"
+                    },
+                    {
+                      "name": "status_associativity",
+                      "expression": "COUNT_IF(`associative_filter_predicate_group`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "filter-multi-select",
+              "encodings": {
+                "fields": [
+                  {
+                    "fieldName": "status",
+                    "displayName": "Status",
+                    "queryName": "q_d4aa8d74"
+                  }
+                ]
+              },
+              "frame": {
+                "title": "Status",
+                "showTitle": true
+              }
+            }
+          },
+          "position": {
+            "x": 2,
+            "y": 0,
+            "width": 2,
+            "height": 2
+          }
+        },
+        {
+          "widget": {
+            "name": "2ac41d30",
+            "queries": [
+              {
+                "name": "q_1d812512",
+                "query": {
+                  "datasetName": "ds_control",
+                  "fields": [
+                    {
+                      "name": "clone_type",
+                      "expression": "`clone_type`"
+                    },
+                    {
+                      "name": "clone_type_associativity",
+                      "expression": "COUNT_IF(`associative_filter_predicate_group`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "filter-multi-select",
+              "encodings": {
+                "fields": [
+                  {
+                    "fieldName": "clone_type",
+                    "displayName": "Clone type",
+                    "queryName": "q_1d812512"
+                  }
+                ]
+              },
+              "frame": {
+                "title": "Clone type",
+                "showTitle": true
+              }
+            }
+          },
+          "position": {
+            "x": 4,
+            "y": 0,
+            "width": 2,
+            "height": 2
+          }
+        },
+        {
+          "widget": {
+            "name": "2760debb",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "ds_kpis",
+                  "fields": [
+                    {
+                      "name": "sum(total_tables)",
+                      "expression": "SUM(`total_tables`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "counter",
+              "encodings": {
+                "value": {
+                  "fieldName": "sum(total_tables)",
+                  "displayName": "Total tables"
+                }
+              },
+              "frame": {
+                "title": "Total tables",
+                "showTitle": true
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 2,
+            "width": 1,
+            "height": 3
+          }
+        },
+        {
+          "widget": {
+            "name": "1a610821",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "ds_kpis",
+                  "fields": [
+                    {
+                      "name": "sum(done_tables)",
+                      "expression": "SUM(`done_tables`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "counter",
+              "encodings": {
+                "value": {
+                  "fieldName": "sum(done_tables)",
+                  "displayName": "Done"
+                }
+              },
+              "frame": {
+                "title": "Done",
+                "showTitle": true
+              }
+            }
+          },
+          "position": {
+            "x": 1,
+            "y": 2,
+            "width": 1,
+            "height": 3
+          }
+        },
+        {
+          "widget": {
+            "name": "a4e5697e",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "ds_kpis",
+                  "fields": [
+                    {
+                      "name": "sum(pct_complete)",
+                      "expression": "SUM(`pct_complete`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "counter",
+              "encodings": {
+                "value": {
+                  "fieldName": "sum(pct_complete)",
+                  "displayName": "% Complete"
+                }
+              },
+              "frame": {
+                "title": "% Complete",
+                "showTitle": true
+              }
+            }
+          },
+          "position": {
+            "x": 2,
+            "y": 2,
+            "width": 1,
+            "height": 3
+          }
+        },
+        {
+          "widget": {
+            "name": "ad74bea0",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "ds_kpis",
+                  "fields": [
+                    {
+                      "name": "sum(active_tables)",
+                      "expression": "SUM(`active_tables`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "counter",
+              "encodings": {
+                "value": {
+                  "fieldName": "sum(active_tables)",
+                  "displayName": "Active"
+                }
+              },
+              "frame": {
+                "title": "Active",
+                "showTitle": true
+              }
+            }
+          },
+          "position": {
+            "x": 3,
+            "y": 2,
+            "width": 1,
+            "height": 3
+          }
+        },
+        {
+          "widget": {
+            "name": "aad62440",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "ds_kpis",
+                  "fields": [
+                    {
+                      "name": "sum(queued_tables)",
+                      "expression": "SUM(`queued_tables`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "counter",
+              "encodings": {
+                "value": {
+                  "fieldName": "sum(queued_tables)",
+                  "displayName": "Queued"
+                }
+              },
+              "frame": {
+                "title": "Queued",
+                "showTitle": true
+              }
+            }
+          },
+          "position": {
+            "x": 4,
+            "y": 2,
+            "width": 1,
+            "height": 3
+          }
+        },
+        {
+          "widget": {
+            "name": "102ae322",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "ds_kpis",
+                  "fields": [
+                    {
+                      "name": "sum(failed_tables)",
+                      "expression": "SUM(`failed_tables`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "counter",
+              "encodings": {
+                "value": {
+                  "fieldName": "sum(failed_tables)",
+                  "displayName": "Failed"
+                }
+              },
+              "frame": {
+                "title": "Failed",
+                "showTitle": true
+              }
+            }
+          },
+          "position": {
+            "x": 5,
+            "y": 2,
+            "width": 1,
+            "height": 3
+          }
+        },
+        {
+          "widget": {
+            "name": "26d4e26e",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "ds_kpis",
+                  "fields": [
+                    {
+                      "name": "sum(total_gb)",
+                      "expression": "SUM(`total_gb`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "counter",
+              "encodings": {
+                "value": {
+                  "fieldName": "sum(total_gb)",
+                  "displayName": "Total GB onboarded"
+                }
+              },
+              "frame": {
+                "title": "Total GB onboarded",
+                "showTitle": true
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 5,
+            "width": 3,
+            "height": 3
+          }
+        },
+        {
+          "widget": {
+            "name": "f71805ac",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "ds_kpis",
+                  "fields": [
+                    {
+                      "name": "sum(gb_done)",
+                      "expression": "SUM(`gb_done`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "counter",
+              "encodings": {
+                "value": {
+                  "fieldName": "sum(gb_done)",
+                  "displayName": "GB migrated"
+                }
+              },
+              "frame": {
+                "title": "GB migrated",
+                "showTitle": true
+              }
+            }
+          },
+          "position": {
+            "x": 3,
+            "y": 5,
+            "width": 3,
+            "height": 3
+          }
+        },
+        {
+          "widget": {
+            "name": "636a5793",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "ds_control",
+                  "fields": [
+                    {
+                      "name": "status",
+                      "expression": "`status`"
+                    },
+                    {
+                      "name": "count(migration_id)",
+                      "expression": "COUNT(`migration_id`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 3,
+              "widgetType": "bar",
+              "encodings": {
+                "x": {
+                  "fieldName": "status",
+                  "scale": {
+                    "type": "categorical"
+                  },
+                  "displayName": "status"
+                },
+                "y": {
+                  "fieldName": "count(migration_id)",
+                  "scale": {
+                    "type": "quantitative"
+                  },
+                  "displayName": "Tables"
+                }
+              },
+              "frame": {
+                "title": "Status distribution",
+                "showTitle": true
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 8,
+            "width": 3,
+            "height": 7
+          }
+        },
+        {
+          "widget": {
+            "name": "561397bf",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "ds_control",
+                  "fields": [
+                    {
+                      "name": "status",
+                      "expression": "`status`"
+                    },
+                    {
+                      "name": "sum(size_gb)",
+                      "expression": "SUM(`size_gb`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 3,
+              "widgetType": "bar",
+              "encodings": {
+                "x": {
+                  "fieldName": "status",
+                  "scale": {
+                    "type": "categorical"
+                  },
+                  "displayName": "status"
+                },
+                "y": {
+                  "fieldName": "sum(size_gb)",
+                  "scale": {
+                    "type": "quantitative"
+                  },
+                  "displayName": "GB"
+                }
+              },
+              "frame": {
+                "title": "GB by status",
+                "showTitle": true
+              }
+            }
+          },
+          "position": {
+            "x": 3,
+            "y": 8,
+            "width": 3,
+            "height": 7
+          }
+        },
+        {
+          "widget": {
+            "name": "1bdd3a7c",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "ds_control",
+                  "fields": [
+                    {
+                      "name": "batch_id",
+                      "expression": "`batch_id`"
+                    },
+                    {
+                      "name": "count(migration_id)",
+                      "expression": "COUNT(`migration_id`)"
+                    },
+                    {
+                      "name": "status",
+                      "expression": "`status`"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 3,
+              "widgetType": "bar",
+              "encodings": {
+                "x": {
+                  "fieldName": "batch_id",
+                  "scale": {
+                    "type": "categorical"
+                  },
+                  "displayName": "batch_id"
+                },
+                "y": {
+                  "fieldName": "count(migration_id)",
+                  "scale": {
+                    "type": "quantitative"
+                  },
+                  "displayName": "Tables"
+                },
+                "color": {
+                  "fieldName": "status",
+                  "scale": {
+                    "type": "categorical"
+                  },
+                  "displayName": "status"
+                }
+              },
+              "frame": {
+                "title": "Tables by batch (stacked by status)",
+                "showTitle": true
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 15,
+            "width": 4,
+            "height": 7
+          }
+        },
+        {
+          "widget": {
+            "name": "b99c5295",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "ds_control",
+                  "fields": [
+                    {
+                      "name": "clone_type",
+                      "expression": "`clone_type`"
+                    },
+                    {
+                      "name": "count(migration_id)",
+                      "expression": "COUNT(`migration_id`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 3,
+              "widgetType": "pie",
+              "encodings": {
+                "angle": {
+                  "fieldName": "count(migration_id)",
+                  "scale": {
+                    "type": "quantitative"
+                  },
+                  "displayName": "tables"
+                },
+                "color": {
+                  "fieldName": "clone_type",
+                  "scale": {
+                    "type": "categorical"
+                  },
+                  "displayName": "clone_type"
+                }
+              },
+              "frame": {
+                "title": "Clone type split",
+                "showTitle": true
+              }
+            }
+          },
+          "position": {
+            "x": 4,
+            "y": 15,
+            "width": 2,
+            "height": 7
+          }
+        }
+      ]
+    },
+    {
+      "name": "throughput",
+      "displayName": "Progress & Throughput",
+      "layout": [
+        {
+          "widget": {
+            "name": "a24a5e5f",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "ds_cumulative",
+                  "fields": [
+                    {
+                      "name": "hour",
+                      "expression": "`hour`"
+                    },
+                    {
+                      "name": "sum(cumulative_done)",
+                      "expression": "SUM(`cumulative_done`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 3,
+              "widgetType": "line",
+              "encodings": {
+                "x": {
+                  "fieldName": "hour",
+                  "scale": {
+                    "type": "temporal"
+                  },
+                  "displayName": "hour"
+                },
+                "y": {
+                  "fieldName": "sum(cumulative_done)",
+                  "scale": {
+                    "type": "quantitative"
+                  },
+                  "displayName": "Tables (running total)"
+                }
+              },
+              "frame": {
+                "title": "Cumulative tables completed",
+                "showTitle": true
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 0,
+            "width": 6,
+            "height": 7
+          }
+        },
+        {
+          "widget": {
+            "name": "d513aed9",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "ds_throughput",
+                  "fields": [
+                    {
+                      "name": "hour",
+                      "expression": "`hour`"
+                    },
+                    {
+                      "name": "sum(tables_done)",
+                      "expression": "SUM(`tables_done`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 3,
+              "widgetType": "bar",
+              "encodings": {
+                "x": {
+                  "fieldName": "hour",
+                  "scale": {
+                    "type": "categorical"
+                  },
+                  "displayName": "hour"
+                },
+                "y": {
+                  "fieldName": "sum(tables_done)",
+                  "scale": {
+                    "type": "quantitative"
+                  },
+                  "displayName": "tables_done"
+                }
+              },
+              "frame": {
+                "title": "Tables completed per hour",
+                "showTitle": true
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 7,
+            "width": 3,
+            "height": 6
+          }
+        },
+        {
+          "widget": {
+            "name": "78a6b057",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "ds_throughput",
+                  "fields": [
+                    {
+                      "name": "hour",
+                      "expression": "`hour`"
+                    },
+                    {
+                      "name": "sum(gb_done)",
+                      "expression": "SUM(`gb_done`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 3,
+              "widgetType": "bar",
+              "encodings": {
+                "x": {
+                  "fieldName": "hour",
+                  "scale": {
+                    "type": "categorical"
+                  },
+                  "displayName": "hour"
+                },
+                "y": {
+                  "fieldName": "sum(gb_done)",
+                  "scale": {
+                    "type": "quantitative"
+                  },
+                  "displayName": "gb_done"
+                }
+              },
+              "frame": {
+                "title": "GB migrated per hour",
+                "showTitle": true
+              }
+            }
+          },
+          "position": {
+            "x": 3,
+            "y": 7,
+            "width": 3,
+            "height": 6
+          }
+        },
+        {
+          "widget": {
+            "name": "bbe48ba1",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "ds_control",
+                  "fields": [
+                    {
+                      "name": "workload_class",
+                      "expression": "`workload_class`"
+                    },
+                    {
+                      "name": "avg(duration_seconds)",
+                      "expression": "AVG(`duration_seconds`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 3,
+              "widgetType": "bar",
+              "encodings": {
+                "x": {
+                  "fieldName": "workload_class",
+                  "scale": {
+                    "type": "categorical"
+                  },
+                  "displayName": "workload_class"
+                },
+                "y": {
+                  "fieldName": "avg(duration_seconds)",
+                  "scale": {
+                    "type": "quantitative"
+                  },
+                  "displayName": "Avg seconds"
+                }
+              },
+              "frame": {
+                "title": "Avg clone duration by workload class",
+                "showTitle": true
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 13,
+            "width": 3,
+            "height": 6
+          }
+        },
+        {
+          "widget": {
+            "name": "58b9920c",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "ds_longest",
+                  "fields": [
+                    {
+                      "name": "source_schema",
+                      "expression": "`source_schema`"
+                    },
+                    {
+                      "name": "source_table",
+                      "expression": "`source_table`"
+                    },
+                    {
+                      "name": "size_gb",
+                      "expression": "`size_gb`"
+                    },
+                    {
+                      "name": "duration_seconds",
+                      "expression": "`duration_seconds`"
+                    },
+                    {
+                      "name": "batch_id",
+                      "expression": "`batch_id`"
+                    },
+                    {
+                      "name": "status",
+                      "expression": "`status`"
+                    }
+                  ],
+                  "disaggregated": true
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "table",
+              "encodings": {
+                "columns": [
+                  {
+                    "fieldName": "source_schema",
+                    "displayName": "Src schema"
+                  },
+                  {
+                    "fieldName": "source_table",
+                    "displayName": "Src table"
+                  },
+                  {
+                    "fieldName": "size_gb",
+                    "displayName": "GB"
+                  },
+                  {
+                    "fieldName": "duration_seconds",
+                    "displayName": "Duration (s)"
+                  },
+                  {
+                    "fieldName": "batch_id",
+                    "displayName": "Batch"
+                  },
+                  {
+                    "fieldName": "status",
+                    "displayName": "Status"
+                  }
+                ]
+              },
+              "frame": {
+                "title": "Longest-running clones (top 50)",
+                "showTitle": true
+              }
+            }
+          },
+          "position": {
+            "x": 3,
+            "y": 13,
+            "width": 3,
+            "height": 8
+          }
+        }
+      ]
+    },
+    {
+      "name": "failures",
+      "displayName": "Failures & Retries",
+      "layout": [
+        {
+          "widget": {
+            "name": "710fafc1",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "ds_failcodes",
+                  "fields": [
+                    {
+                      "name": "error_code",
+                      "expression": "`error_code`"
+                    },
+                    {
+                      "name": "sum(n)",
+                      "expression": "SUM(`n`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 3,
+              "widgetType": "bar",
+              "encodings": {
+                "x": {
+                  "fieldName": "error_code",
+                  "scale": {
+                    "type": "categorical"
+                  },
+                  "displayName": "error_code"
+                },
+                "y": {
+                  "fieldName": "sum(n)",
+                  "scale": {
+                    "type": "quantitative"
+                  },
+                  "displayName": "Count"
+                }
+              },
+              "frame": {
+                "title": "Failures by error code",
+                "showTitle": true
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 0,
+            "width": 3,
+            "height": 6
+          }
+        },
+        {
+          "widget": {
+            "name": "fe3b223e",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "ds_control",
+                  "fields": [
+                    {
+                      "name": "attempt_number",
+                      "expression": "`attempt_number`"
+                    },
+                    {
+                      "name": "count(migration_id)",
+                      "expression": "COUNT(`migration_id`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 3,
+              "widgetType": "bar",
+              "encodings": {
+                "x": {
+                  "fieldName": "attempt_number",
+                  "scale": {
+                    "type": "categorical"
+                  },
+                  "displayName": "attempt_number"
+                },
+                "y": {
+                  "fieldName": "count(migration_id)",
+                  "scale": {
+                    "type": "quantitative"
+                  },
+                  "displayName": "Tables"
+                }
+              },
+              "frame": {
+                "title": "Attempts distribution",
+                "showTitle": true
+              }
+            }
+          },
+          "position": {
+            "x": 3,
+            "y": 0,
+            "width": 3,
+            "height": 6
+          }
+        },
+        {
+          "widget": {
+            "name": "9a6d5b66",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "ds_attempts_daily",
+                  "fields": [
+                    {
+                      "name": "day",
+                      "expression": "`day`"
+                    },
+                    {
+                      "name": "sum(n)",
+                      "expression": "SUM(`n`)"
+                    },
+                    {
+                      "name": "status",
+                      "expression": "`status`"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 3,
+              "widgetType": "bar",
+              "encodings": {
+                "x": {
+                  "fieldName": "day",
+                  "scale": {
+                    "type": "categorical"
+                  },
+                  "displayName": "day"
+                },
+                "y": {
+                  "fieldName": "sum(n)",
+                  "scale": {
+                    "type": "quantitative"
+                  },
+                  "displayName": "Attempts"
+                },
+                "color": {
+                  "fieldName": "status",
+                  "scale": {
+                    "type": "categorical"
+                  },
+                  "displayName": "status"
+                }
+              },
+              "frame": {
+                "title": "Retry outcomes over time",
+                "showTitle": true
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 6,
+            "width": 6,
+            "height": 6
+          }
+        },
+        {
+          "widget": {
+            "name": "dbfb4112",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "ds_failures",
+                  "fields": [
+                    {
+                      "name": "source_schema",
+                      "expression": "`source_schema`"
+                    },
+                    {
+                      "name": "source_table",
+                      "expression": "`source_table`"
+                    },
+                    {
+                      "name": "status",
+                      "expression": "`status`"
+                    },
+                    {
+                      "name": "error_code",
+                      "expression": "`error_code`"
+                    },
+                    {
+                      "name": "error_message",
+                      "expression": "`error_message`"
+                    },
+                    {
+                      "name": "attempt_number",
+                      "expression": "`attempt_number`"
+                    },
+                    {
+                      "name": "max_attempts",
+                      "expression": "`max_attempts`"
+                    },
+                    {
+                      "name": "batch_id",
+                      "expression": "`batch_id`"
+                    },
+                    {
+                      "name": "updated_at",
+                      "expression": "`updated_at`"
+                    }
+                  ],
+                  "disaggregated": true
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "table",
+              "encodings": {
+                "columns": [
+                  {
+                    "fieldName": "source_schema",
+                    "displayName": "Src schema"
+                  },
+                  {
+                    "fieldName": "source_table",
+                    "displayName": "Src table"
+                  },
+                  {
+                    "fieldName": "status",
+                    "displayName": "Status"
+                  },
+                  {
+                    "fieldName": "error_code",
+                    "displayName": "Error code"
+                  },
+                  {
+                    "fieldName": "error_message",
+                    "displayName": "Error message"
+                  },
+                  {
+                    "fieldName": "attempt_number",
+                    "displayName": "Attempt"
+                  },
+                  {
+                    "fieldName": "max_attempts",
+                    "displayName": "Max"
+                  },
+                  {
+                    "fieldName": "batch_id",
+                    "displayName": "Batch"
+                  },
+                  {
+                    "fieldName": "updated_at",
+                    "displayName": "Updated"
+                  }
+                ]
+              },
+              "frame": {
+                "title": "Failure detail",
+                "showTitle": true
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 12,
+            "width": 6,
+            "height": 8
+          }
+        }
+      ]
+    },
+    {
+      "name": "validation",
+      "displayName": "Validation",
+      "layout": [
+        {
+          "widget": {
+            "name": "1b6e87bf",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "ds_control",
+                  "fields": [
+                    {
+                      "name": "validation_status",
+                      "expression": "`validation_status`"
+                    },
+                    {
+                      "name": "count(migration_id)",
+                      "expression": "COUNT(`migration_id`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 3,
+              "widgetType": "pie",
+              "encodings": {
+                "angle": {
+                  "fieldName": "count(migration_id)",
+                  "scale": {
+                    "type": "quantitative"
+                  },
+                  "displayName": "tables"
+                },
+                "color": {
+                  "fieldName": "validation_status",
+                  "scale": {
+                    "type": "categorical"
+                  },
+                  "displayName": "validation_status"
+                }
+              },
+              "frame": {
+                "title": "Validation status",
+                "showTitle": true
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 0,
+            "width": 2,
+            "height": 6
+          }
+        },
+        {
+          "widget": {
+            "name": "01b5bc23",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "ds_control",
+                  "fields": [
+                    {
+                      "name": "row_count_status",
+                      "expression": "`row_count_status`"
+                    },
+                    {
+                      "name": "count(migration_id)",
+                      "expression": "COUNT(`migration_id`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 3,
+              "widgetType": "bar",
+              "encodings": {
+                "x": {
+                  "fieldName": "row_count_status",
+                  "scale": {
+                    "type": "categorical"
+                  },
+                  "displayName": "row_count_status"
+                },
+                "y": {
+                  "fieldName": "count(migration_id)",
+                  "scale": {
+                    "type": "quantitative"
+                  },
+                  "displayName": "Tables"
+                }
+              },
+              "frame": {
+                "title": "Row-count check outcome",
+                "showTitle": true
+              }
+            }
+          },
+          "position": {
+            "x": 2,
+            "y": 0,
+            "width": 4,
+            "height": 6
+          }
+        },
+        {
+          "widget": {
+            "name": "4b66455e",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "ds_valhist_daily",
+                  "fields": [
+                    {
+                      "name": "day",
+                      "expression": "`day`"
+                    },
+                    {
+                      "name": "sum(n)",
+                      "expression": "SUM(`n`)"
+                    },
+                    {
+                      "name": "status",
+                      "expression": "`status`"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 3,
+              "widgetType": "line",
+              "encodings": {
+                "x": {
+                  "fieldName": "day",
+                  "scale": {
+                    "type": "temporal"
+                  },
+                  "displayName": "day"
+                },
+                "y": {
+                  "fieldName": "sum(n)",
+                  "scale": {
+                    "type": "quantitative"
+                  },
+                  "displayName": "Attempts"
+                },
+                "color": {
+                  "fieldName": "status",
+                  "scale": {
+                    "type": "categorical"
+                  },
+                  "displayName": "status"
+                }
+              },
+              "frame": {
+                "title": "Validation attempts over time",
+                "showTitle": true
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 6,
+            "width": 6,
+            "height": 6
+          }
+        },
+        {
+          "widget": {
+            "name": "b2199be3",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "ds_mismatch",
+                  "fields": [
+                    {
+                      "name": "source_schema",
+                      "expression": "`source_schema`"
+                    },
+                    {
+                      "name": "source_table",
+                      "expression": "`source_table`"
+                    },
+                    {
+                      "name": "source_version",
+                      "expression": "`source_version`"
+                    },
+                    {
+                      "name": "target_version",
+                      "expression": "`target_version`"
+                    },
+                    {
+                      "name": "source_row_count",
+                      "expression": "`source_row_count`"
+                    },
+                    {
+                      "name": "target_row_count",
+                      "expression": "`target_row_count`"
+                    },
+                    {
+                      "name": "validation_status",
+                      "expression": "`validation_status`"
+                    },
+                    {
+                      "name": "updated_at",
+                      "expression": "`updated_at`"
+                    }
+                  ],
+                  "disaggregated": true
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "table",
+              "encodings": {
+                "columns": [
+                  {
+                    "fieldName": "source_schema",
+                    "displayName": "Src schema"
+                  },
+                  {
+                    "fieldName": "source_table",
+                    "displayName": "Src table"
+                  },
+                  {
+                    "fieldName": "source_version",
+                    "displayName": "Src ver"
+                  },
+                  {
+                    "fieldName": "target_version",
+                    "displayName": "Tgt ver"
+                  },
+                  {
+                    "fieldName": "source_row_count",
+                    "displayName": "Src rows"
+                  },
+                  {
+                    "fieldName": "target_row_count",
+                    "displayName": "Tgt rows"
+                  },
+                  {
+                    "fieldName": "validation_status",
+                    "displayName": "Status"
+                  },
+                  {
+                    "fieldName": "updated_at",
+                    "displayName": "Updated"
+                  }
+                ]
+              },
+              "frame": {
+                "title": "Row-count mismatches",
+                "showTitle": true
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 12,
+            "width": 6,
+            "height": 8
+          }
+        }
+      ]
+    },
+    {
+      "name": "inventory",
+      "displayName": "Inventory, Chunks & Exclusions",
+      "layout": [
+        {
+          "widget": {
+            "name": "70419809",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "ds_control",
+                  "fields": [
+                    {
+                      "name": "workload_class",
+                      "expression": "`workload_class`"
+                    },
+                    {
+                      "name": "count(migration_id)",
+                      "expression": "COUNT(`migration_id`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 3,
+              "widgetType": "bar",
+              "encodings": {
+                "x": {
+                  "fieldName": "workload_class",
+                  "scale": {
+                    "type": "categorical"
+                  },
+                  "displayName": "workload_class"
+                },
+                "y": {
+                  "fieldName": "count(migration_id)",
+                  "scale": {
+                    "type": "quantitative"
+                  },
+                  "displayName": "Tables"
+                }
+              },
+              "frame": {
+                "title": "Tables by workload class",
+                "showTitle": true
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 0,
+            "width": 3,
+            "height": 6
+          }
+        },
+        {
+          "widget": {
+            "name": "4a10e55a",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "ds_control",
+                  "fields": [
+                    {
+                      "name": "workload_class",
+                      "expression": "`workload_class`"
+                    },
+                    {
+                      "name": "sum(size_gb)",
+                      "expression": "SUM(`size_gb`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 3,
+              "widgetType": "bar",
+              "encodings": {
+                "x": {
+                  "fieldName": "workload_class",
+                  "scale": {
+                    "type": "categorical"
+                  },
+                  "displayName": "workload_class"
+                },
+                "y": {
+                  "fieldName": "sum(size_gb)",
+                  "scale": {
+                    "type": "quantitative"
+                  },
+                  "displayName": "GB"
+                }
+              },
+              "frame": {
+                "title": "GB by workload class",
+                "showTitle": true
+              }
+            }
+          },
+          "position": {
+            "x": 3,
+            "y": 0,
+            "width": 3,
+            "height": 6
+          }
+        },
+        {
+          "widget": {
+            "name": "ef5101fe",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "ds_chunks",
+                  "fields": [
+                    {
+                      "name": "batch_id",
+                      "expression": "`batch_id`"
+                    },
+                    {
+                      "name": "chunk_id",
+                      "expression": "`chunk_id`"
+                    },
+                    {
+                      "name": "tables",
+                      "expression": "`tables`"
+                    },
+                    {
+                      "name": "gb",
+                      "expression": "`gb`"
+                    },
+                    {
+                      "name": "done",
+                      "expression": "`done`"
+                    }
+                  ],
+                  "disaggregated": true
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "table",
+              "encodings": {
+                "columns": [
+                  {
+                    "fieldName": "batch_id",
+                    "displayName": "Batch"
+                  },
+                  {
+                    "fieldName": "chunk_id",
+                    "displayName": "Chunk"
+                  },
+                  {
+                    "fieldName": "tables",
+                    "displayName": "Tables"
+                  },
+                  {
+                    "fieldName": "gb",
+                    "displayName": "GB"
+                  },
+                  {
+                    "fieldName": "done",
+                    "displayName": "Done"
+                  }
+                ]
+              },
+              "frame": {
+                "title": "Chunk fan-out per batch",
+                "showTitle": true
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 6,
+            "width": 6,
+            "height": 7
+          }
+        },
+        {
+          "widget": {
+            "name": "643bb618",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "ds_excl",
+                  "fields": [
+                    {
+                      "name": "exclusion_type",
+                      "expression": "`exclusion_type`"
+                    },
+                    {
+                      "name": "count(source_table)",
+                      "expression": "COUNT(`source_table`)"
+                    }
+                  ],
+                  "disaggregated": false
+                }
+              }
+            ],
+            "spec": {
+              "version": 3,
+              "widgetType": "bar",
+              "encodings": {
+                "x": {
+                  "fieldName": "exclusion_type",
+                  "scale": {
+                    "type": "categorical"
+                  },
+                  "displayName": "exclusion_type"
+                },
+                "y": {
+                  "fieldName": "count(source_table)",
+                  "scale": {
+                    "type": "quantitative"
+                  },
+                  "displayName": "Count"
+                }
+              },
+              "frame": {
+                "title": "Exclusions by type",
+                "showTitle": true
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 13,
+            "width": 2,
+            "height": 6
+          }
+        },
+        {
+          "widget": {
+            "name": "a9e93fe3",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "ds_excl",
+                  "fields": [
+                    {
+                      "name": "source_catalog",
+                      "expression": "`source_catalog`"
+                    },
+                    {
+                      "name": "source_schema",
+                      "expression": "`source_schema`"
+                    },
+                    {
+                      "name": "source_table",
+                      "expression": "`source_table`"
+                    },
+                    {
+                      "name": "exclusion_type",
+                      "expression": "`exclusion_type`"
+                    },
+                    {
+                      "name": "exclusion_rule",
+                      "expression": "`exclusion_rule`"
+                    },
+                    {
+                      "name": "excluded_at",
+                      "expression": "`excluded_at`"
+                    }
+                  ],
+                  "disaggregated": true
+                }
+              }
+            ],
+            "spec": {
+              "version": 2,
+              "widgetType": "table",
+              "encodings": {
+                "columns": [
+                  {
+                    "fieldName": "source_catalog",
+                    "displayName": "Catalog"
+                  },
+                  {
+                    "fieldName": "source_schema",
+                    "displayName": "Schema"
+                  },
+                  {
+                    "fieldName": "source_table",
+                    "displayName": "Table"
+                  },
+                  {
+                    "fieldName": "exclusion_type",
+                    "displayName": "Type"
+                  },
+                  {
+                    "fieldName": "exclusion_rule",
+                    "displayName": "Rule"
+                  },
+                  {
+                    "fieldName": "excluded_at",
+                    "displayName": "Excluded at"
+                  }
+                ]
+              },
+              "frame": {
+                "title": "Excluded tables",
+                "showTitle": true
+              }
+            }
+          },
+          "position": {
+            "x": 2,
+            "y": 13,
+            "width": 4,
+            "height": 7
+          }
+        }
+      ]
+    }
+  ]
+}

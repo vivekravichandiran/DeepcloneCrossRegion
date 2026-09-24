@@ -11,6 +11,21 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 > heading (most recent first), with the date and the files touched. Keep entries
 > concise and factual.
 
+## [1.8.0] - 2026-09-24
+
+### Added
+- **AI/BI (Lakeview) Ops telemetry dashboard** for the migration, built from the
+  four audit tables (`migration_control`, `migration_attempts`,
+  `migration_validation_history`, `migration_exclusion_log`) on warehouse
+  `5fe1692f119e2528`. 5 pages / 33 widgets: Overview (KPIs, status/GB/batch
+  breakdowns, filters), Progress & Throughput (burn-up, per-hour, durations),
+  Failures & Retries (error codes, attempts, detail), Validation (row-count
+  match/mismatch, trend), Inventory/Chunks/Exclusions.
+  - `docs/AIBI_Dashboard_Design.md` — design (Ops rationale, datasets, charts).
+  - `scripts/build_migration_dashboard.py` — generator for the serialized dashboard.
+  - `dashboards/migration_telemetry.lvdash.json` — serialized dashboard.
+  - Deployed dashboard_id `01f1b7b6bcbe1b18adeec1598cd1dc76`.
+
 ## [1.7.0] - 2026-09-24
 
 ### Changed

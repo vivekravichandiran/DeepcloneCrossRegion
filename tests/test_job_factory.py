@@ -169,33 +169,40 @@ def test_all_clusters_uc_safe(specs):
             assert nc["spark_env_vars"]["PYTHONPATH"] == FILE_ROOT, name
 
 
-def test_worker_cluster_json_embedded(specs):
+def test_worker_cluster_json_is_runtime_templated(specs):
+    """worker_cluster_json is a JSON *string* whose compute fields are
+    {{job.parameters.*}} templates so the pool / VM type / worker count / Spark
+    version are overridable from the 'Run now' panel. The notebook resolves the
+    pool-vs-node choice at run time (Databricks rejects a spec with both)."""
     dc = specs["DeepClone 3 - DEEP_CLONE [prod]"]
     wcj = dc["tasks"][0]["notebook_task"]["base_parameters"]["worker_cluster_json"]
-    parsed = json.loads(wcj)   # must be a valid JSON *string*
-    # Chunk workers ALWAYS use the pre-warmed instance pool by default — node
-    # type is governed by the pool, so node_type_id/azure_attributes must be
-    # absent to avoid an invalid "both pool and node type" cluster spec.
-    assert parsed["instance_pool_id"] == "0924-004044-comic1-pool-63p33jj6"
-    assert "node_type_id" not in parsed
-    assert "azure_attributes" not in parsed
-    assert parsed["num_workers"] == 8
+    parsed = json.loads(wcj)   # must still be a valid JSON *string*
+    assert parsed["spark_version"] == "{{job.parameters.worker_spark_version}}"
+    assert parsed["instance_pool_id"] == "{{job.parameters.worker_instance_pool_id}}"
+    assert parsed["node_type_id"] == "{{job.parameters.worker_node_type}}"
+    assert parsed["num_workers"] == "{{job.parameters.worker_num_workers}}"
     assert parsed["data_security_mode"] == "DATA_SECURITY_MODE_AUTO"
 
 
-def test_worker_cluster_json_falls_back_to_on_demand_when_no_pool(params):
-    """With worker_instance_pool_id blank, chunk workers revert to on-demand
-    node_type_id provisioning (no instance_pool_id)."""
-    p = dict(params)
-    p["worker_instance_pool_id"] = ""
-    specs = build_all_job_specs(p)
-    dc = specs["DeepClone 3 - DEEP_CLONE [prod]"]
-    parsed = json.loads(
-        dc["tasks"][0]["notebook_task"]["base_parameters"]["worker_cluster_json"]
-    )
-    assert "instance_pool_id" not in parsed
-    assert parsed["node_type_id"] == "Standard_E32ds_v5"
-    assert parsed["azure_attributes"]["availability"] == "ON_DEMAND_AZURE"
+def test_worker_compute_exposed_as_job_parameters(specs):
+    """DEEP_CLONE, RETRY and the full workflow expose the chunk-worker compute
+    knobs as job parameters (so they can be overridden at run time) with the
+    factory defaults."""
+    expected = {
+        "worker_spark_version": "17.3.x-scala2.13",
+        "worker_instance_pool_id": "0924-004044-comic1-pool-63p33jj6",
+        "worker_node_type": "Standard_E32ds_v5",
+        "worker_num_workers": "8",
+    }
+    for job_name in (
+        "DeepClone 3 - DEEP_CLONE [prod]",
+        "DeepClone 5 - RETRY [prod]",
+        "DeepClone - Full Migration Workflow [prod]",
+    ):
+        spec = specs[job_name]
+        got = {pp["name"]: pp["default"] for pp in spec["parameters"]}
+        for k, v in expected.items():
+            assert got.get(k) == v, f"{job_name}: {k}={got.get(k)!r} != {v!r}"
 
 
 # ── 6. Serialisable + reset wrapping ─────────────────────────────────────────
@@ -235,13 +242,19 @@ def test_missing_required_param_raises():
     assert "orchestrator_notebook" in str(ei.value)
 
 
-def test_standalone_clone_and_retry_carry_both_warehouse_ids(specs):
-    # Regression: standalone DEEP_CLONE and RETRY base_parameters must pass BOTH
-    # warehouse ids through (matches resources/03_*.yml + resources/05_*.yml).
+def test_standalone_clone_and_retry_drop_source_warehouse_and_default_worker_nb(specs):
+    # CSV-oriented (applied to ALL jobs): standalone DEEP_CLONE and RETRY no
+    # longer expose source_warehouse_id or worker_notebook_path as job params;
+    # worker_notebook_path is the resolved deployed path (a literal).
+    expected_nb = f"{FILE_ROOT}/notebooks/chunk_worker_notebook"
     for name in ("DeepClone 3 - DEEP_CLONE [prod]", "DeepClone 5 - RETRY [prod]"):
+        pnames = {p["name"] for p in specs[name]["parameters"]}
+        assert "source_warehouse_id" not in pnames, name
+        assert "worker_notebook_path" not in pnames, name
         bp = specs[name]["tasks"][0]["notebook_task"]["base_parameters"]
         assert bp["target_warehouse_id"] == "{{job.parameters.target_warehouse_id}}", name
-        assert bp["source_warehouse_id"] == "{{job.parameters.source_warehouse_id}}", name
+        assert "source_warehouse_id" not in bp, name
+        assert bp["worker_notebook_path"] == expected_nb, name
 
 
 def test_retry_permanent_job_param_present_and_default_false(specs):
@@ -265,6 +278,82 @@ def test_retry_permanent_wired_into_retry_base_parameters(specs):
     wf_retry = {t["task_key"]: t for t in wf["tasks"]}["retry"]
     wf_retry_bp = wf_retry["notebook_task"]["base_parameters"]
     assert wf_retry_bp["retry_permanent"] == "{{job.parameters.retry_permanent}}"
+
+
+def test_workflow_csv_params_removed(specs):
+    # CSV-oriented workflow: these are NOT exposed as job parameters anymore.
+    wf = specs["DeepClone - Full Migration Workflow [prod]"]
+    names = {p["name"] for p in wf["parameters"]}
+    for removed in (
+        "yaml_config_path", "source_catalogs", "source_schemas", "source_tables",
+        "target_catalog", "source_warehouse_id", "worker_notebook_path",
+        "selection_type",
+    ):
+        assert removed not in names, f"{removed} should not be a workflow job parameter"
+    # But the CSV inputs it DOES rely on must remain.
+    assert "csv_path" in names
+    assert "exclusion_csv_path" in names
+    assert "input_type" in names
+
+
+def test_workflow_selection_type_hardcoded_in_inventory_and_dry_run(specs):
+    wf = specs["DeepClone - Full Migration Workflow [prod]"]
+    tasks = {t["task_key"]: t for t in wf["tasks"]}
+    for tk in ("inventory", "dry_run"):
+        bp = tasks[tk]["notebook_task"]["base_parameters"]
+        # Fixed default value, NOT a {{job.parameters.*}} template.
+        assert bp["selection_type"] == "catalog", tk
+        # Removed selection inputs must not be forwarded either.
+        for removed in ("yaml_config_path", "source_catalogs", "source_schemas",
+                        "source_tables", "target_catalog", "source_warehouse_id"):
+            assert removed not in bp, f"{removed} still forwarded in {tk}"
+
+
+def test_workflow_worker_notebook_path_hardcoded(specs):
+    # worker_notebook_path is now the resolved deployed path (a literal), not a
+    # {{job.parameters.*}} template, on both clone-dispatching tasks.
+    wf = specs["DeepClone - Full Migration Workflow [prod]"]
+    tasks = {t["task_key"]: t for t in wf["tasks"]}
+    expected = f"{FILE_ROOT}/notebooks/chunk_worker_notebook"
+    for tk in ("deep_clone", "retry"):
+        bp = tasks[tk]["notebook_task"]["base_parameters"]
+        assert bp["worker_notebook_path"] == expected, tk
+        assert "{{job.parameters" not in bp["worker_notebook_path"], tk
+
+
+def test_workflow_validate_drops_source_warehouse(specs):
+    wf = specs["DeepClone - Full Migration Workflow [prod]"]
+    tasks = {t["task_key"]: t for t in wf["tasks"]}
+    val_bp = tasks["validate"]["notebook_task"]["base_parameters"]
+    assert "source_warehouse_id" not in val_bp
+    # target warehouse is still passed through
+    assert val_bp["target_warehouse_id"] == "{{job.parameters.target_warehouse_id}}"
+
+
+def test_all_jobs_drop_csv_irrelevant_params(specs):
+    # CSV-oriented trimming applies to ALL jobs (not just the workflow): none of
+    # these should be exposed as job parameters on ANY job.
+    removed_everywhere = {
+        "source_catalogs", "source_schemas", "source_tables", "target_catalog",
+        "yaml_config_path", "source_warehouse_id", "worker_notebook_path",
+        "selection_type",
+    }
+    for name, spec in specs.items():
+        names = {p["name"] for p in spec["parameters"]}
+        leaked = removed_everywhere & names
+        assert not leaked, f"{name} still exposes {leaked}"
+
+
+def test_standalone_inventory_and_dry_run_are_csv_oriented(specs):
+    # INVENTORY + standalone DRY_RUN drive selection from the CSV: input_type +
+    # csv_path present, selection_type hardcoded to 'catalog' in base_parameters.
+    for name in ("DeepClone 1 - INVENTORY [prod]", "DeepClone 2 - DRY_RUN [prod]"):
+        pnames = {p["name"] for p in specs[name]["parameters"]}
+        assert "input_type" in pnames, name
+        assert "csv_path" in pnames, name
+        bp = specs[name]["tasks"][0]["notebook_task"]["base_parameters"]
+        assert bp["selection_type"] == "catalog", name
+        assert bp["input_type"] == "{{job.parameters.input_type}}", name
 
 
 def test_success_email_only_on_deep_clone_and_workflow(specs):

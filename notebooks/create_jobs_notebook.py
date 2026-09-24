@@ -47,6 +47,18 @@ for _p in [
     if _p and _p not in sys.path:
         sys.path.insert(0, _p)
 
+# Drop any stale cached `orchestrator` modules BEFORE importing. On a warm
+# cluster, Python's sys.modules cache persists across notebook re-runs, so a
+# module imported during an earlier run is returned as-is and a fresh
+# `databricks sync` of orchestrator/*.py is silently ignored — the exact cause
+# of "I updated job_factory but the recreated jobs still show the old
+# parameters". Clearing the cache + invalidating import finders forces a
+# re-read from disk on every run.
+import importlib  # noqa: E402
+for _m in [m for m in list(sys.modules) if m == "orchestrator" or m.startswith("orchestrator.")]:
+    del sys.modules[_m]
+importlib.invalidate_caches()
+
 from orchestrator.job_factory import (  # noqa: E402
     build_all_job_specs,
     resolve_workspace_params,

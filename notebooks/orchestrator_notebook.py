@@ -388,6 +388,34 @@ if _worker_cluster and _worker_cluster.strip() not in ("", "{}"):
     if "data_security_mode" not in cfg.worker_cluster_config:
         cfg.worker_cluster_config["data_security_mode"] = "DATA_SECURITY_MODE_AUTO"
         log.info("worker_cluster_json had no data_security_mode — defaulted to DATA_SECURITY_MODE_AUTO for Unity Catalog compatibility")
+
+    # ── Normalize chunk-worker compute: pool XOR node type ────────────────────
+    # worker_cluster_json now carries BOTH instance_pool_id and node_type_id as
+    # run-time job-parameter values (so the pool / VM type / worker count are
+    # overridable from the Jobs 'Run now' panel). Databricks rejects a cluster
+    # spec that sets BOTH, so pick exactly one here: prefer the pre-warmed pool
+    # when worker_instance_pool_id is non-blank (node type is governed by the
+    # pool), otherwise fall back to an on-demand node type. Pre-warmed pools
+    # avoid on-demand Azure capacity failures (AZURE_QUOTA_EXCEEDED /
+    # CLOUD_PROVIDER_RESOURCE_STOCKOUT).
+    _wc = cfg.worker_cluster_config
+    _wpool = str(_wc.get("instance_pool_id", "") or "").strip()
+    if _wpool:
+        _wc["instance_pool_id"] = _wpool
+        _wc.pop("node_type_id", None)
+        _wc.pop("azure_attributes", None)
+        log.info("Chunk-worker compute: using instance pool %s (node type governed by pool)", _wpool)
+    else:
+        _wc.pop("instance_pool_id", None)
+        if str(_wc.get("node_type_id", "") or "").strip():
+            _wc["azure_attributes"] = {"availability": "ON_DEMAND_AZURE"}
+            log.info("Chunk-worker compute: no pool set — using on-demand node type %s", _wc.get("node_type_id"))
+    # num_workers may arrive as a string via job-parameter templating.
+    if "num_workers" in _wc:
+        try:
+            _wc["num_workers"] = int(_wc["num_workers"])
+        except (TypeError, ValueError):
+            log.warning("worker_cluster_json num_workers=%r not an int — leaving as-is", _wc.get("num_workers"))
     log.info("Worker cluster config loaded (%d keys)", len(cfg.worker_cluster_config))
 
 # Worker/chunk-worker notebook path — MUST match the actual deployed workspace

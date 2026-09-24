@@ -18,8 +18,20 @@ resources:
           default: ${var.row_count_validation}
         - name: max_retries
           default: ${var.max_retries}
+        # ── Chunk-worker compute (overridable at run time) ────────────────────
+        # These back the {{job.parameters.*}} templates in worker_cluster_json,
+        # so the pool / VM type / worker count / Spark version can be changed
+        # from the 'Run now' panel. The orchestrator notebook uses the pool when
+        # worker_instance_pool_id is non-blank, else falls back to the on-demand
+        # node type (Databricks rejects a spec that sets both).
         - name: worker_spark_version
           default: ${var.worker_spark_version}
+        - name: worker_instance_pool_id
+          default: ${var.worker_instance_pool_id}
+        - name: worker_node_type
+          default: ${var.worker_node_type}
+        - name: worker_num_workers
+          default: "${var.worker_num_workers}"
         # ── Batch / Chunk parameters ──────────────────────────────────────────
         # batch_id MUST match the value used during INVENTORY for the same scope
         - name: batch_id
@@ -32,22 +44,16 @@ resources:
           default: "50"         # GB cap per chunk (should match INVENTORY setting)
         - name: min_executors
           default: ${var.min_executors}   # minimum Spark worker nodes (executors) per chunk cluster
-        - name: worker_notebook_path
-          default: ${var.worker_notebook}   # deployed path to chunk_worker_notebook
-        # target_warehouse_id / source_warehouse_id: plain (non-secret) SQL
-        # warehouse identifiers — NOT credentials. No client_id/client_secret/
-        # secret-scope anywhere: SqlClient/ApiClient authenticate natively via
-        # databricks.sdk.core.Config().
+        # worker_notebook_path is no longer a job parameter — it uses a fixed
+        # default (${var.worker_notebook}) hardcoded in base_parameters below.
+        # target_warehouse_id: plain (non-secret) SQL warehouse identifier —
+        # NOT a credential. SqlClient/ApiClient authenticate natively via
+        # databricks.sdk.core.Config(). (source_warehouse_id is omitted — only
+        # used for clone_type=direct_adls; DEEP_CLONE never uses src_sql.)
         - name: target_warehouse_id
           default: ${var.target_warehouse_id}
-        - name: source_warehouse_id
-          default: ${var.source_warehouse_id}
         # clone_type: MUST match whatever clone_type INVENTORY actually used
-        # for this batch (validate_config() requires source_warehouse_id
-        # non-blank when clone_type=direct_adls — a hardcoded "direct_adls"
-        # here regardless of the real batch's clone_type used to silently
-        # rely on leftover dummy secret values to pass validation; now that
-        # there are no secrets at all, it must be wired for real).
+        # for this batch.
         - name: clone_type
           default: ${var.clone_type}
 
@@ -69,9 +75,8 @@ resources:
               parallel_threads: "{{job.parameters.parallel_threads}}"
               chunk_capacity_gb: "{{job.parameters.chunk_capacity_gb}}"
               min_executors: "{{job.parameters.min_executors}}"
-              worker_notebook_path: "{{job.parameters.worker_notebook_path}}"
+              worker_notebook_path: ${var.worker_notebook}
               target_warehouse_id: "{{job.parameters.target_warehouse_id}}"
-              source_warehouse_id: "{{job.parameters.source_warehouse_id}}"
               # Chunk worker cluster spec — provisioned on-demand (NOT via the
               # shared control-plane instance_pool_id — that pool is pinned to
               # a fixed, smaller VM type). num_workers enforced to >=
@@ -87,9 +92,10 @@ resources:
               # (AZURE_QUOTA_EXCEEDED / CLOUD_PROVIDER_RESOURCE_STOCKOUT).
               worker_cluster_json: >
                 {
-                  "spark_version": "${var.worker_spark_version}",
-                  "instance_pool_id": "${var.worker_instance_pool_id}",
-                  "num_workers": ${var.worker_num_workers},
+                  "spark_version": "{{job.parameters.worker_spark_version}}",
+                  "instance_pool_id": "{{job.parameters.worker_instance_pool_id}}",
+                  "node_type_id": "{{job.parameters.worker_node_type}}",
+                  "num_workers": "{{job.parameters.worker_num_workers}}",
                   "data_security_mode": "DATA_SECURITY_MODE_AUTO",
                   "spark_conf": {"spark.databricks.delta.preview.enabled": "true"}
                 }

@@ -7,31 +7,28 @@ resources:
         team: deepclone
         phase: dry_run
 
+      # CSV-oriented (mirrors the workflow's dry_run): selection comes from the
+      # CSV via input_type/csv_path — no JOB-mode source_catalogs/schemas/tables/
+      # target_catalog/source_warehouse_id. selection_type is a fixed default
+      # hardcoded in base_parameters below.
       parameters:
-        - name: source_catalogs
-          default: ${var.source_catalog_filter}
-        - name: source_schemas
-          default: ${var.source_schema_filter}
-        - name: source_tables
-          default: ${var.source_table_filter}
-        - name: target_catalog
-          default: ${var.target_catalog}
+        - name: input_type
+          default: ${var.input_type}
+        - name: csv_path
+          default: ${var.csv_path}
+        - name: exclusion_csv_path
+          default: ${var.exclusion_csv_path}
         - name: clone_type
           default: ${var.clone_type}
         - name: meta_catalog
           default: ${var.meta_catalog}
         - name: meta_schema
           default: ${var.meta_schema}
-        - name: selection_type
-          default: catalog
-        # target_warehouse_id / source_warehouse_id: plain (non-secret) SQL
-        # warehouse identifiers — NOT credentials. No client_id/client_secret/
-        # secret-scope: SqlClient/ApiClient authenticate natively via
+        # target_warehouse_id: plain (non-secret) SQL warehouse identifier —
+        # NOT a credential. SqlClient/ApiClient authenticate natively via
         # databricks.sdk.core.Config().
         - name: target_warehouse_id
           default: ${var.target_warehouse_id}
-        - name: source_warehouse_id
-          default: ${var.source_warehouse_id}
 
       tasks:
         - task_key: dry_run
@@ -39,17 +36,14 @@ resources:
             notebook_path: ${var.orchestrator_notebook}
             base_parameters:
               mode: DRY_RUN
-              input_type: JOB
-              selection_type: "{{job.parameters.selection_type}}"
-              source_catalogs: "{{job.parameters.source_catalogs}}"
-              source_schemas: "{{job.parameters.source_schemas}}"
-              source_tables: "{{job.parameters.source_tables}}"
-              target_catalog: "{{job.parameters.target_catalog}}"
+              input_type: "{{job.parameters.input_type}}"
+              csv_path: "{{job.parameters.csv_path}}"
+              exclusion_csv_path: "{{job.parameters.exclusion_csv_path}}"
+              selection_type: catalog
               clone_type: "{{job.parameters.clone_type}}"
               meta_catalog: "{{job.parameters.meta_catalog}}"
               meta_schema: "{{job.parameters.meta_schema}}"
               target_warehouse_id: "{{job.parameters.target_warehouse_id}}"
-              source_warehouse_id: "{{job.parameters.source_warehouse_id}}"
           job_cluster_key: orchestrator_cluster
 
       job_clusters:

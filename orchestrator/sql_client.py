@@ -15,11 +15,13 @@ Features
 • Polls statement until SUCCEEDED / FAILED with configurable timeout.
 • Returns typed rows as List[Dict[str, Any]].
 • Separate source and target clients, each with their own Config/auth context.
-• Rate-limit awareness (backs off on 429).
+• Transient-failure resilience: all HTTP calls retry with exponential backoff +
+  jitter on HTTP 429/5xx (e.g. a 500 INTERNAL_ERROR) and network errors.
 """
 
 from __future__ import annotations
 import time
+import random
 import logging
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -47,6 +49,20 @@ class SqlClient:
     # Warehouse cold-start can be slow; wait up to 30 minutes for RUNNING.
     _WAREHOUSE_START_TIMEOUT_S = 1800  # 30 minutes
     _WAREHOUSE_START_POLL_S    = 5
+
+    # ── Transient-failure retry policy ──────────────────────────────────────
+    # The SQL Statement Execution / Warehouses APIs can return transient
+    # server-side errors (HTTP 5xx, e.g. INTERNAL_ERROR "request failed due to
+    # an unexpected condition") or throttle (429), and the network hop itself
+    # can drop (ConnectionError/Timeout). None of these mean the request was
+    # invalid — retrying with exponential backoff + jitter almost always
+    # succeeds. All HTTP calls in this client go through _request(), which
+    # retries on these classes of failure only (non-transient 4xx like a bad
+    # SQL statement or a 404 are returned immediately, never retried).
+    _MAX_RETRIES        = 5
+    _BACKOFF_BASE_S     = 2.0
+    _BACKOFF_CAP_S      = 30.0
+    _TRANSIENT_STATUS   = frozenset({429, 500, 502, 503, 504})
 
     def __init__(
         self,
@@ -116,35 +132,87 @@ class SqlClient:
         headers["Content-Type"] = "application/json"
         return headers
 
-    def _submit(self, sql: str) -> Tuple[str, Dict]:
-        for attempt in range(3):
-            resp = requests.post(
-                f"{self._url}/api/2.0/sql/statements",
-                headers=self._headers(),
-                json={
-                    "statement":       sql,
-                    "warehouse_id":    self._wh,
-                    "wait_timeout":    "50s",
-                    "on_wait_timeout": "CONTINUE",
-                },
-                timeout=65,
-            )
-            if resp.status_code == 429:
-                log.warning("Rate limited — backing off 30s")
-                time.sleep(30)
-                continue
-            if not resp.ok:
-                raise RuntimeError(
-                    f"{resp.status_code} POST /api/2.0/sql/statements: {resp.text[:2000]}"
+    def _backoff_s(self, attempt: int, resp: Optional[requests.Response] = None) -> float:
+        """Exponential backoff with jitter. Honours a Retry-After header on 429."""
+        if resp is not None and resp.status_code == 429:
+            ra = resp.headers.get("Retry-After")
+            if ra:
+                try:
+                    return float(ra)
+                except ValueError:
+                    pass
+        return min(self._BACKOFF_CAP_S, self._BACKOFF_BASE_S * (2 ** attempt)) + random.uniform(0, 1)
+
+    def _request(self, method: str, url: str, *, timeout: int, **kwargs) -> requests.Response:
+        """
+        Perform an HTTP request with retry + exponential backoff on TRANSIENT
+        failures only: HTTP 429/5xx and network errors (ConnectionError /
+        Timeout). Non-transient responses (e.g. 4xx) are returned as-is for the
+        caller to handle — they are never retried. Raises the last error after
+        _MAX_RETRIES exhausted.
+        """
+        last_err: Optional[Exception] = None
+        for attempt in range(self._MAX_RETRIES):
+            try:
+                resp = requests.request(
+                    method, url, headers=self._headers(), timeout=timeout, **kwargs
                 )
-            d = resp.json()
-            return d["statement_id"], d
-        raise RuntimeError("Failed to submit SQL after 3 retries (rate limited)")
+            except (requests.ConnectionError, requests.Timeout) as e:
+                last_err = e
+                if attempt == self._MAX_RETRIES - 1:
+                    break
+                wait = self._backoff_s(attempt)
+                log.warning(
+                    "Network error on %s %s (attempt %d/%d): %s — retrying in %.1fs",
+                    method, url, attempt + 1, self._MAX_RETRIES, e, wait,
+                )
+                time.sleep(wait)
+                continue
+
+            if resp.status_code in self._TRANSIENT_STATUS:
+                last_err = RuntimeError(
+                    f"{resp.status_code} {method} {url}: {resp.text[:2000]}"
+                )
+                if attempt == self._MAX_RETRIES - 1:
+                    break
+                wait = self._backoff_s(attempt, resp)
+                log.warning(
+                    "Transient %d on %s %s (attempt %d/%d) — retrying in %.1fs: %s",
+                    resp.status_code, method, url, attempt + 1, self._MAX_RETRIES,
+                    wait, resp.text[:200],
+                )
+                time.sleep(wait)
+                continue
+
+            return resp  # success or non-transient error — let caller decide
+
+        raise RuntimeError(
+            f"{method} {url} failed after {self._MAX_RETRIES} attempts: {last_err}"
+        )
+
+    def _submit(self, sql: str) -> Tuple[str, Dict]:
+        resp = self._request(
+            "POST",
+            f"{self._url}/api/2.0/sql/statements",
+            timeout=65,
+            json={
+                "statement":       sql,
+                "warehouse_id":    self._wh,
+                "wait_timeout":    "50s",
+                "on_wait_timeout": "CONTINUE",
+            },
+        )
+        if not resp.ok:
+            raise RuntimeError(
+                f"{resp.status_code} POST /api/2.0/sql/statements: {resp.text[:2000]}"
+            )
+        d = resp.json()
+        return d["statement_id"], d
 
     def _poll(self, stmt_id: str) -> Dict:
-        resp = requests.get(
+        resp = self._request(
+            "GET",
             f"{self._url}/api/2.0/sql/statements/{stmt_id}",
-            headers=self._headers(),
             timeout=30,
         )
         if not resp.ok:
@@ -195,9 +263,9 @@ class SqlClient:
 
         # Fetch remaining chunks if any
         for chunk_idx in range(1, total_chunks):
-            resp = requests.get(
+            resp = self._request(
+                "GET",
                 f"{self._url}/api/2.0/sql/statements/{stmt_id}/result/chunks/{chunk_idx}",
-                headers=self._headers(),
                 timeout=60,
             )
             if not resp.ok:
@@ -217,9 +285,9 @@ class SqlClient:
 
     def start_warehouse(self) -> None:
         """Start the warehouse if not already RUNNING."""
-        requests.post(
+        self._request(
+            "POST",
             f"{self._url}/api/2.0/sql/warehouses/{self._wh}/start",
-            headers=self._headers(),
             timeout=30,
         )
         log.info("Warehouse %s start requested", self._wh)
@@ -229,9 +297,9 @@ class SqlClient:
         # doesn't fail the run prematurely.
         deadline = time.time() + self._WAREHOUSE_START_TIMEOUT_S
         while time.time() < deadline:
-            r = requests.get(
+            r = self._request(
+                "GET",
                 f"{self._url}/api/2.0/sql/warehouses/{self._wh}",
-                headers=self._headers(),
                 timeout=20,
             ).json()
             if r.get("state") == "RUNNING":

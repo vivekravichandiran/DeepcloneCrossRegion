@@ -109,16 +109,21 @@ dbutils.widgets.dropdown("validation_enabled", "true", ["true", "false"], "07 ·
 dbutils.widgets.text("target_warehouse_id", "5fe1692f119e2528", "08 · Target SQL warehouse id")
 
 # ── Compute ───────────────────────────────────────────────────────────────────
-dbutils.widgets.text("worker_node_type", "Standard_E32ds_v5", "09 · Worker node type")
-dbutils.widgets.text("worker_num_workers", "8", "10 · Worker node count")
-dbutils.widgets.text("instance_pool_id", "0908-093007-hoped4-pool-q4mi8hia", "11 · Instance pool id (orchestrator)")
+# Chunk-worker clusters (DEEP_CLONE/RETRY): when the chunk-worker POOL below is
+# set (non-blank), the pool governs the VM type and `worker_node_type` is
+# ignored at runtime; leave the pool blank to provision on-demand using
+# `worker_node_type`. (Databricks rejects a cluster spec that sets both.)
+dbutils.widgets.text("worker_node_type", "Standard_E32ds_v5", "09 · Chunk-worker node type (used only when chunk-worker pool is blank)")
+dbutils.widgets.text("worker_num_workers", "8", "10 · Chunk-worker node count")
+dbutils.widgets.text("worker_instance_pool_id", "0924-004044-comic1-pool-63p33jj6", "11 · Chunk-worker instance pool id (blank = on-demand worker node type)")
+dbutils.widgets.text("instance_pool_id", "0908-093007-hoped4-pool-q4mi8hia", "12 · Orchestrator instance pool id")
 
 # ── Chunk execution ───────────────────────────────────────────────────────────
-dbutils.widgets.text("max_concurrent_chunks", "5", "12 · Max concurrent chunks")
-dbutils.widgets.text("parallel_threads", "4", "13 · Parallel threads per chunk")
-dbutils.widgets.text("chunk_capacity_gb", "500", "14 · Chunk capacity (GB)")
-dbutils.widgets.text("min_executors", "8", "15 · Min executors per chunk")
-dbutils.widgets.text("inventory_parallel_threads", "4", "16 · Inventory parallel threads")
+dbutils.widgets.text("max_concurrent_chunks", "5", "13 · Max concurrent chunks")
+dbutils.widgets.text("parallel_threads", "4", "14 · Parallel threads per chunk")
+dbutils.widgets.text("chunk_capacity_gb", "500", "15 · Chunk capacity (GB)")
+dbutils.widgets.text("min_executors", "8", "16 · Min executors per chunk")
+dbutils.widgets.text("inventory_parallel_threads", "4", "17 · Inventory parallel threads")
 
 # COMMAND ----------
 
@@ -146,7 +151,8 @@ _widget_names = [
     "csv_path", "exclusion_csv_path",
     "clone_type", "validation_enabled",
     "target_warehouse_id",
-    "worker_node_type", "worker_num_workers", "instance_pool_id",
+    "worker_node_type", "worker_num_workers",
+    "worker_instance_pool_id", "instance_pool_id",
     "max_concurrent_chunks", "parallel_threads", "chunk_capacity_gb",
     "min_executors", "inventory_parallel_threads",
 ]

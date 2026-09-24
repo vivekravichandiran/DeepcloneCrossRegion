@@ -1,7 +1,7 @@
 # DeepClone CrossRegion — SOP: Running a CSV-based Migration (`input_type = CSV`, `clone_type = delta_share`)
 
 **Document ID:** SOP-DCR-CSV-01
-**Version:** 1.6
+**Version:** 1.7
 **Owner:** Data Platform Engineering
 **Applies to bundle:** `deepclone_orchestrator` (`databricks.yml`)
 **Classification:** Internal — Data Engineering
@@ -124,23 +124,11 @@ All three must succeed and use the **exact same `source_catalog`/`source_schema`
 
 ## Step 1 — Prepare the CSV table-mapping file
 
-Two CSV formats are supported, auto-detected by `InputResolver._resolve_csv()` (`orchestrator/input_resolver.py`) from the presence of a `clone_type` header column. Pick whichever fits your load.
+Two CSV formats are supported, auto-detected by `InputResolver._resolve_csv()` (`orchestrator/input_resolver.py`) from the presence of a `clone_type` header column.
 
-### Format A — Legacy explicit table list (no `clone_type` column)
+> **✅ Use Format B (below) — it is the canonical, supported format for all migrations.** It handles single tables, whole schemas, and whole catalogs (with exclusions) in one file, so it covers every case Format A does and more. Format A is retained only for backward compatibility with old table-list files; **new CSVs should always use Format B.**
 
-One row = one explicit table mapping, no wildcards. Target columns are optional — omit them to default to the same name as source.
-
-```csv
-source_catalog,source_schema,source_table,target_catalog,target_schema,target_table
-ril_bulk_02,iot,dim_iot_01,ril_tgt_02,iot,dim_iot_01
-ril_bulk_02,iot,dim_iot_02,ril_tgt_02,iot,dim_iot_02
-ril_bulk_02,marketing,dim_marketing_01,ril_tgt_02,marketing,dim_marketing_01
-ril_bulk_02,marketing,dim_marketing_02,ril_tgt_02,marketing,dim_marketing_02
-```
-
-Use this for a small, hand-picked list of tables (a handful of tables, a cherry-picked back-fill, a one-off DR copy).
-
-### Format B — Row-level catalog/schema/table selection with exclusions (has a `clone_type` column)
+### Format B — Row-level catalog/schema/table selection with exclusions (has a `clone_type` column) — **RECOMMENDED / CANONICAL**
 
 Header (column order matters, all 9 columns required — leave cells blank where not applicable):
 
@@ -167,7 +155,19 @@ catalog,ril_bulk_csvtest,,,ril_tgt_02,,,['hr'],"['*lineage*','dim_finance_03']"
 
 This example (verified end-to-end, see §18 Change Log v1.1) resolves to exactly 7 tables: `finance.dim_finance_01` (explicit rename via the `table` row), `finance.dim_finance_02` + `finance.fact_finance_txn` (via the `catalog` row — `dim_finance_03` and `finance_lineage_log` excluded by pattern, `hr` schema excluded entirely so it isn't double-counted against the `schema` row below), and `hr.dim_hr_01`/`dim_hr_02`/`dim_hr_03`/`fact_hr_payroll` (via the `schema` row — `hr_table1` excluded). Rows are evaluated in file order and de-duplicated on `source_fqn` — if two rows resolve the same source table, the **first** row's target mapping wins (this is how the explicit `table` row's rename takes priority over the broader `catalog` row above).
 
-> Tip: keep one CSV per logical load (e.g. `csv_<team>_<date>.csv`) so you can tell at a glance what a batch contains. `configs/archive/csv_test_ril_bulk_02.csv` (Format A, archived) and `configs/csv_test_ril_bulk_csvtest.csv` (Format B) in this repo are working, previously-verified examples of each format. `configs/csv_scale_ril_bulk_02_full.csv` is the current default (Format B, single `catalog`-type row cloning the entire `ril_bulk_02` catalog — used for the 8-cluster scale test, see §18 Change Log v1.3).
+> Tip: keep one CSV per logical load (e.g. `csv_<team>_<date>.csv`) so you can tell at a glance what a batch contains. `configs/csv_test_ril_bulk_csvtest.csv` in this repo is a working, previously-verified Format B example. `configs/csv_scale_ril_bulk_02_full.csv` is the current default (Format B, single `catalog`-type row cloning the entire `ril_bulk_02` catalog — used for the 8-cluster scale test, see §18 Change Log v1.3).
+
+> **Common cause of "INVENTORY completed but 0 tables":** a `catalog`- or `schema`-type row is expanded **live** against the source metastore (`SHOW SCHEMAS`/`SHOW TABLES`). If the `source_catalog` isn't visible from the **target** workspace (not Delta-Shared / not same-metastore — see §3.1), it resolves to **0 tables** and INVENTORY still finishes green. Confirm with the §3.1 verification query, or use explicit `table` rows to rule out expansion. Check the driver log line `Input: type=CSV ... effective_input_path=<your csv>` to confirm the CSV you intended was actually the one loaded.
+
+### Format A — Legacy explicit table list (no `clone_type` column) — *legacy, avoid for new CSVs*
+
+Retained only for backward compatibility. One row = one explicit table mapping, no wildcards, no exclusions. `target_*` columns are optional (default to source). Prefer a Format B `table` row instead.
+
+```csv
+source_catalog,source_schema,source_table,target_catalog,target_schema,target_table
+ril_bulk_02,iot,dim_iot_01,ril_tgt_02,iot,dim_iot_01
+ril_bulk_02,marketing,dim_marketing_01,ril_tgt_02,marketing,dim_marketing_01
+```
 
 ### Optional — Global exclusion list (`exclusion_csv_path`)
 
@@ -556,6 +556,7 @@ ORDER BY excluded_at DESC;
 
 | Version | Date | Author | Change |
 |---|---|---|---|
+| 1.7 | 2026-09-24 | Data Platform Engineering | **Made CSV Format B the canonical/recommended format** (Step 1 reordered — Format B first and marked RECOMMENDED/CANONICAL; Format A demoted to a clearly-labelled legacy subsection). Added a prominent "INVENTORY completed but 0 tables" callout explaining that `catalog`/`schema` rows expand live against the source metastore and resolve to 0 when `source_catalog` isn't visible from the target workspace (cross-links §3.1 + the `effective_input_path` driver-log check). Unrelated but shipped together: fixed `notebooks/create_jobs_notebook.py` so the **chunk-worker instance pool** is now an exposed widget (`worker_instance_pool_id`, widget 11) instead of silently defaulting to an internal test pool — every pool/compute value entered in the create-jobs notebook now becomes the created job's parameter default. |
 | 1.6 | 2026-09-17 | Data Platform Engineering | **Fixed silent cross-batch history loss in `migration_control`.** Previously, `migration_control`'s identity was keyed only on `(source_catalog, source_schema, source_table)` — so onboarding the SAME source table under a NEW `batch_id` (e.g. re-running the same CSV in the evening after a morning run) would find and silently overwrite the earlier batch's row (`orchestrator/inventory_manager.py::_get_existing()`/`_upsert()`/`_mark_permanent_failure()`/`_mark_skipped_target_missing()`), losing that batch's `batch_id`, timestamps, and row counts. The identity key is now `(source_catalog, source_schema, source_table, batch_id)` — every `batch_id` gets its OWN row per source table, full historical lineage across batches is preserved directly in `migration_control`, and re-running the SAME `batch_id` remains idempotent (updates its own row, no duplicates). Also fixed a related bug where `_mark_permanent_failure()` never stamped `batch_id` on `FAILED_PERMANENT` rows at all. `force_reonboard` semantics narrowed accordingly — see the updated Step 5 note. Verified with a dedicated multi-batch test: the same 2 source tables run through **5 different batches** (3 standalone-job batches, 1 same-batch idempotent re-run, 1 `force_reonboard` same-batch reset, and 1 full chained `06_full_migration_workflow` run with the governance gate ON) each produced its own independent, correctly-tracked row — zero cross-batch bleed, confirmed via `migration_control`, `migration_attempts`, and `migration_validation_history`. Full report: [`Test_Report_MultiBatch_History.md`](Test_Report_MultiBatch_History.md). |
 | 1.5 | 2026-09-16 | Data Platform Engineering | Added the **`require_target_precreated` governance gate** (`orchestrator/inventory_manager.py::_target_exists()` / `_mark_skipped_target_missing()`) — an opt-in job/bundle parameter that makes INVENTORY skip (not auto-create) any table whose target doesn't already exist, marking it `status=SKIPPED`/`error_code=TARGET_NOT_PRECREATED` so DEEP_CLONE/RETRY (which only select `status='QUEUED'`) can never touch it. Recovery path: pre-create the target out-of-band, then re-run INVENTORY with `force_reonboard=true` to flip it back to `QUEUED`. Documented in Step 1 ("Optional — Governance gate") and Step 2 (`databricks.yml` wiring). Fixed two bugs found during testing: `_mark_skipped_target_missing()`'s MERGE wasn't refreshing `target_catalog`/`target_schema`/`target_table` or resetting `validation_status`/row-counts/timestamps on re-skip, leaving misleading stale data on SKIPPED rows. Verified with a 6-case test matrix (unit test + standalone INVENTORY/DEEP_CLONE + recovery + full end-to-end `06_full_migration_workflow` run) — full results in [`Test_Report_Target_Precreated_Gate.md`](Test_Report_Target_Precreated_Gate.md). |
 | 1.4 | 2026-09-10 | Data Platform Engineering | **Removed all external secrets.** Deleted the `deepclone-migration` Databricks Secret scope and every `client_id`/`client_secret`/`{{secrets/...}}` reference from `orchestrator/sql_client.py`, `orchestrator/api_client.py`, `orchestrator/config.py`, `notebooks/setup_control_tables.py`, and every `resources/*.yml` job cluster / `worker_cluster_json` spec. `SqlClient`/`ApiClient` now authenticate natively via `databricks.sdk.core.Config()` (Databricks unified/runtime auth — automatic inside any job/notebook, nothing to provision or rotate). The only workspace-connection values left are the plain, non-secret `target_warehouse_id` / `source_warehouse_id` bundle variables (SQL warehouse IDs, not credentials) — wired as job parameters on every job (`00`–`06`). Also fixed a latent bug this change surfaced: `03_deep_clone_job.yml`/`05_retry_job.yml` hard-coded/omitted `clone_type`, which only "worked" before because of leftover non-blank dummy secret values satisfying the old (weak) validation check — both now read `clone_type` from `${var.clone_type}` like every other job. Deleted the fully-superseded, secret-dependent `scripts/deploy_to_workspace.py` and `tests/generate_report.py` (pre-bundle, already marked stale/unused). Verified end-to-end **with the secret scope deleted**: ran INVENTORY → DEEP_CLONE → VALIDATE against a fresh batch (`no-secrets-test-*`, 7 tables) on `ril_bulk_csvtest` → `ril_tgt_02` — all 7 `VALIDATED` with matching row counts, zero auth errors. |

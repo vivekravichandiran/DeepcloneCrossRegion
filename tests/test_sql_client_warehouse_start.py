@@ -43,8 +43,12 @@ from orchestrator.sql_client import SqlClient
 class _Resp:
     """Minimal stand-in for a requests.Response."""
 
-    def __init__(self, payload):
+    def __init__(self, payload, status_code=200):
         self._p = payload
+        self.status_code = status_code
+        self.ok = 200 <= status_code < 400
+        self.headers = {}
+        self.text = ""
 
     def json(self):
         return self._p
@@ -75,14 +79,15 @@ def _install_fake_clock(monkeypatch):
 def test_warehouse_up_after_10min_succeeds(monkeypatch):
     """Warehouse stays STARTING for ~10 min, then RUNNING -> must NOT raise."""
     clock = _install_fake_clock(monkeypatch)
-    monkeypatch.setattr(sc.requests, "post", lambda *a, **k: _Resp({}))
 
-    def fake_get(*a, **k):
-        # Not RUNNING until 10 minutes (600s) of simulated wait have elapsed.
+    def fake_request(method, url, *a, **k):
+        if method == "POST":            # /start
+            return _Resp({})
+        # GET /warehouses/{id}: not RUNNING until 10 min (600s) simulated.
         state = "RUNNING" if clock["t"] >= 600 else "STARTING"
         return _Resp({"state": state})
 
-    monkeypatch.setattr(sc.requests, "get", fake_get)
+    monkeypatch.setattr(sc.requests, "request", fake_request)
 
     c = _make_client()
     c.start_warehouse()   # should return cleanly, not raise
@@ -96,8 +101,11 @@ def test_warehouse_up_after_10min_succeeds(monkeypatch):
 def test_warehouse_never_starts_times_out_at_30min(monkeypatch):
     """Warehouse never reaches RUNNING -> raises TimeoutError near 1800s."""
     clock = _install_fake_clock(monkeypatch)
-    monkeypatch.setattr(sc.requests, "post", lambda *a, **k: _Resp({}))
-    monkeypatch.setattr(sc.requests, "get", lambda *a, **k: _Resp({"state": "STARTING"}))
+
+    def fake_request(method, url, *a, **k):
+        return _Resp({}) if method == "POST" else _Resp({"state": "STARTING"})
+
+    monkeypatch.setattr(sc.requests, "request", fake_request)
 
     c = _make_client()
     with pytest.raises(TimeoutError) as ei:
@@ -106,6 +114,67 @@ def test_warehouse_never_starts_times_out_at_30min(monkeypatch):
     assert "did not start" in str(ei.value)
     assert "1800" in str(ei.value)
     assert clock["t"] >= sc.SqlClient._WAREHOUSE_START_TIMEOUT_S
+
+
+def test_submit_retries_on_transient_500_then_succeeds(monkeypatch):
+    """Regression: a POST /api/2.0/sql/statements that returns a transient
+    500 INTERNAL_ERROR must be retried (with backoff), not raised on the first
+    attempt. Two 500s followed by a 200 must ultimately succeed."""
+    monkeypatch.setattr(sc.time, "sleep", lambda s: None)   # no real backoff waits
+
+    calls = {"n": 0}
+
+    def fake_request(method, url, *a, **k):
+        calls["n"] += 1
+        if calls["n"] <= 2:
+            return _Resp(
+                {"error_code": "INTERNAL_ERROR", "message": "unexpected condition"},
+                status_code=500,
+            )
+        return _Resp({"statement_id": "stmt-123", "status": {"state": "SUCCEEDED"}})
+
+    monkeypatch.setattr(sc.requests, "request", fake_request)
+
+    c = _make_client()
+    stmt_id, payload = c._submit("CREATE SCHEMA IF NOT EXISTS a.b")
+    assert stmt_id == "stmt-123"
+    assert calls["n"] == 3            # 2 transient failures + 1 success
+
+
+def test_submit_raises_after_exhausting_retries_on_persistent_500(monkeypatch):
+    """A persistently failing 500 raises only AFTER _MAX_RETRIES attempts."""
+    monkeypatch.setattr(sc.time, "sleep", lambda s: None)
+    calls = {"n": 0}
+
+    def fake_request(method, url, *a, **k):
+        calls["n"] += 1
+        return _Resp({"error_code": "INTERNAL_ERROR"}, status_code=500)
+
+    monkeypatch.setattr(sc.requests, "request", fake_request)
+
+    c = _make_client()
+    with pytest.raises(RuntimeError) as ei:
+        c._submit("SELECT 1")
+    assert calls["n"] == sc.SqlClient._MAX_RETRIES
+    assert "after" in str(ei.value).lower()
+
+
+def test_submit_does_not_retry_non_transient_4xx(monkeypatch):
+    """A non-transient 400 (e.g. bad SQL) is returned/raised immediately —
+    retrying a client error would be pointless."""
+    monkeypatch.setattr(sc.time, "sleep", lambda s: None)
+    calls = {"n": 0}
+
+    def fake_request(method, url, *a, **k):
+        calls["n"] += 1
+        return _Resp({"error_code": "BAD_REQUEST"}, status_code=400)
+
+    monkeypatch.setattr(sc.requests, "request", fake_request)
+
+    c = _make_client()
+    with pytest.raises(RuntimeError):
+        c._submit("SELCT 1")          # typo -> 400
+    assert calls["n"] == 1            # NOT retried
 
 
 def test_timeout_constant_is_30_minutes():

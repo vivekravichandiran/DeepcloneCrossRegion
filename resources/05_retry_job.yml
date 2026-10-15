@@ -2,6 +2,7 @@ resources:
   jobs:
     retry_job:
       name: "DeepClone 5 - RETRY [${bundle.target}]"
+      timeout_seconds: 604800   # 7 days — orchestrator run safety net
       description: "Re-queues RETRY_PENDING tables with exponential backoff and re-dispatches clones."
       tags:
         team: deepclone

@@ -172,7 +172,7 @@ class OrchestratorConfig:
     # ── Execution ──
     stale_threshold_minutes:   int  = 120      # reconcile stuck IN_PROGRESS records
     poll_interval_s:           int  = 30
-    worker_timeout_minutes:    int  = 180
+    worker_timeout_minutes:    int  = 10080    # 7 days — per-chunk cluster-job timeout (see migration.yaml)
     api_throttle_delay_s:      float = 0.2
 
     # ── Exclusion ──

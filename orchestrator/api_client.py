@@ -145,7 +145,7 @@ class ApiClient:
         meta_catalog:      str,
         meta_schema:       str,
         run_name:          str = "migration-worker",
-        timeout_minutes:   int = 180,
+        timeout_minutes:   int = 10080,   # 7 days (fallback; real value = cfg.worker_timeout_minutes)
         new_cluster_config: Optional[Dict] = None,
         extra_params:       Optional[Dict] = None,
     ) -> int:
@@ -227,7 +227,7 @@ class ApiClient:
         self,
         run_id:       int,
         interval_s:   int = 30,
-        timeout_s:    int = 10800,
+        timeout_s:    int = 604800,   # 7 days (fallback; real value = cfg.worker_timeout_minutes * 60)
     ) -> Dict[str, Any]:
         """
         Block until the run reaches a terminal life_cycle_state.

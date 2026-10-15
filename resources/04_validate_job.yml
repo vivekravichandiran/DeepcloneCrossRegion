@@ -2,6 +2,7 @@ resources:
   jobs:
     validate_job:
       name: "DeepClone 4 - VALIDATE [${bundle.target}]"
+      timeout_seconds: 604800   # 7 days — orchestrator run safety net
       description: "Validates COMPLETED clone records: size, file count, Delta version, and row count (counted VERSION AS OF the source_version/target_version captured in migration_control). Row counts are persisted to migration_control (latest) and migration_validation_history (append-only audit trail)."
       tags:
         team: deepclone

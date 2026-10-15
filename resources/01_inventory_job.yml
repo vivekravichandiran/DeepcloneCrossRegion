@@ -2,6 +2,7 @@ resources:
   jobs:
     inventory_job:
       name: "DeepClone 1 - INVENTORY [${bundle.target}]"
+      timeout_seconds: 604800   # 7 days — orchestrator run safety net
       description: "Discovers and onboards source tables into migration_control (QUEUED status)."
       tags:
         team: deepclone

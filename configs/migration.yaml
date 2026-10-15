@@ -136,7 +136,7 @@ execution:
   validation_enabled: true     # run VALIDATE phase after DEEP_CLONE
   row_count_validation: false  # COUNT(*) comparison — expensive on large tables
   stale_threshold_minutes: 120 # requeue IN_PROGRESS records stuck beyond this
-  worker_timeout_minutes: 180  # max runtime for each chunk cluster job
+  worker_timeout_minutes: 10080  # 7 days — max runtime for each chunk cluster job
 
   # Schema/table exclusion list (supplement per-mapping excludes and global exclude)
   exclude_schemas:

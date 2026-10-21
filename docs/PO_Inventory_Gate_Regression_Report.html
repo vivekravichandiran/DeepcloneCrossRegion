@@ -1,0 +1,136 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<title>Predictive Optimization Inventory Gate — Regression Report</title>
+<style>
+  @page { size: A4; margin: 18mm 16mm; }
+  * { box-sizing: border-box; }
+  body { font-family: -apple-system, "Helvetica Neue", Arial, sans-serif; color: #1a1f29;
+         font-size: 11.2px; line-height: 1.55; margin: 0; }
+  h1 { font-size: 23px; margin: 0 0 2px; color: #0b2a4a; }
+  h2 { font-size: 15px; margin: 22px 0 8px; color: #0b2a4a;
+       border-bottom: 2px solid #d7e3ef; padding-bottom: 4px; }
+  h3 { font-size: 12.5px; margin: 14px 0 5px; color: #14477d; }
+  .sub { color: #5a6b80; font-size: 11px; margin: 0 0 4px; }
+  .meta { color: #7a8aa0; font-size: 10px; margin-bottom: 12px; }
+  code { background: #f1f5fa; border: 1px solid #e0e8f2; border-radius: 3px;
+         padding: 0.5px 4px; font-family: "SF Mono", Menlo, monospace; font-size: 10px; }
+  pre { background: #0f1b2d; color: #e8eef7; padding: 10px 12px; border-radius: 6px;
+        font-family: "SF Mono", Menlo, monospace; font-size: 9.4px; line-height: 1.45;
+        white-space: pre-wrap; }
+  table { border-collapse: collapse; width: 100%; margin: 8px 0; font-size: 10.2px; }
+  th { background: #0b2a4a; color: #fff; text-align: left; padding: 6px 8px; font-weight: 600; }
+  td { border: 1px solid #dde6f0; padding: 5px 8px; vertical-align: top; }
+  tr:nth-child(even) td { background: #f7fafd; }
+  .pass { color: #1b7a3d; font-weight: 700; }
+  .fail { color: #b3261e; font-weight: 700; }
+  .pill { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 9.2px; font-weight: 700; }
+  .p-pass { background: #e4f7ea; color: #1b7a3d; }
+  .p-block { background: #fde8e6; color: #b3261e; }
+  .p-queue { background: #e7f0fb; color: #14477d; }
+  .callout { background: #f3f8ff; border-left: 4px solid #2f74c0; padding: 9px 12px;
+             border-radius: 0 5px 5px 0; margin: 10px 0; }
+  .ok { background: #effaf1; border-left: 4px solid #2f9e52; }
+  ul { margin: 5px 0; padding-left: 20px; } li { margin: 2px 0; }
+  .foot { margin-top: 26px; color: #8493a6; font-size: 9px; border-top: 1px solid #e0e8f2; padding-top: 6px; }
+  .big { font-size: 13px; font-weight: 700; }
+</style></head><body>
+
+<h1>Regression Report — Predictive Optimization Inventory Gate</h1>
+<p class="sub">Live end-to-end + unit regression — Deep Clone Cross-Region Migration Orchestrator</p>
+<p class="meta">Workspace: <b>vk-west</b> (<code>adb-7405612780454429.9.azuredatabricks.net</code>) &nbsp;•&nbsp;
+   Warehouse <code>345e7fb63d50405e</code> &nbsp;•&nbsp; Control tables <code>po_ctl_t2.migration_meta</code> &nbsp;•&nbsp; Oct 21, 2026</p>
+
+<div class="callout ok"><span class="big">Result: PASS.</span> All 3 live scenarios behaved exactly as designed, and
+the full unit suite is green (<b>70 passed</b>, incl. 10 PO-specific tests). The gate was exercised against
+<b>real</b> orchestrator modules (<code>InputResolver</code>, <code>PredictiveOptimizationChecker</code>, <code>InventoryManager</code>,
+<code>plan_chunks</code>, Deep Clone, row-count validation) hitting the live Unity Catalog REST API.</p>
+
+<h2>1. Test fixtures (created live in vk-west)</h2>
+<table>
+  <tr><th>Object</th><th>PO setting</th><th>Tables (rows)</th></tr>
+  <tr><td><code>po_e2e_cat_a</code> (catalog)</td><td>DISABLE</td><td>—</td></tr>
+  <tr><td>&nbsp;&nbsp;↳ <code>sa_ok</code></td><td>DISABLE (inherits)</td><td><code>t_a1</code>=5, <code>t_a2</code>=7</td></tr>
+  <tr><td>&nbsp;&nbsp;↳ <code>sa_on</code></td><td><b>ENABLE (schema)</b></td><td><code>t_sch1</code>=2, <code>t_sch2</code>=3</td></tr>
+  <tr><td>&nbsp;&nbsp;↳ <code>sa_mixed</code></td><td>DISABLE</td><td><code>t_m_ok</code>=4 (DISABLE), <code>t_m_on</code>=4 (<b>ENABLE table</b>)</td></tr>
+  <tr><td><code>po_e2e_cat_b</code> (catalog)</td><td><b>ENABLE (catalog)</b></td><td>—</td></tr>
+  <tr><td>&nbsp;&nbsp;↳ <code>sb</code></td><td>ENABLE (inherits)</td><td><code>t_b1</code>=6, <code>t_b2</code>=6</td></tr>
+  <tr><td><code>po_e2e_cat_c</code> (catalog)</td><td>DISABLE</td><td>—</td></tr>
+  <tr><td>&nbsp;&nbsp;↳ <code>sc1</code></td><td>DISABLE (inherits)</td><td><code>t_c1a</code>=8, <code>t_c1b</code>=9</td></tr>
+  <tr><td><code>po_ctl_t2.po_e2e_clean</code></td><td>DISABLE</td><td><code>t_single</code>=10</td></tr>
+  <tr><td><code>po_e2e_tgt</code> (catalog)</td><td>target</td><td>Deep Clone destination</td></tr>
+</table>
+
+<h2>2. Scenario 1 — all selections qualify for failure</h2>
+<p>CSV: table row (<code>sa_mixed.t_m_on</code>, table-level ENABLE), schema row (<code>sa_on</code>, schema-level ENABLE),
+catalog row (<code>po_e2e_cat_b</code>, catalog-level ENABLE). <b>Expected:</b> 5 resolved, all blocked, 0 queued, step fails.</p>
+<table>
+  <tr><th>Source table</th><th>Detected level</th><th>Outcome</th></tr>
+  <tr><td><code>sa_mixed.t_m_on</code></td><td>TABLE</td><td><span class="pill p-block">PO_BLOCKED</span></td></tr>
+  <tr><td><code>sa_on.t_sch1</code></td><td>SCHEMA (sa_on)</td><td><span class="pill p-block">PO_BLOCKED</span></td></tr>
+  <tr><td><code>sa_on.t_sch2</code></td><td>SCHEMA (sa_on)</td><td><span class="pill p-block">PO_BLOCKED</span></td></tr>
+  <tr><td><code>sb.t_b1</code></td><td>CATALOG (po_e2e_cat_b)</td><td><span class="pill p-block">PO_BLOCKED</span></td></tr>
+  <tr><td><code>sb.t_b2</code></td><td>CATALOG (po_e2e_cat_b)</td><td><span class="pill p-block">PO_BLOCKED</span></td></tr>
+</table>
+<p><b>Observed:</b> <code>total=5 inserted(QUEUED)=0 po_blocked=5 failed=0</code>; inventory step fails. <span class="pass">PASS</span>
+— inheritance level correctly identified as TABLE / SCHEMA / CATALOG in each case.</p>
+
+<h2>3. Scenario 2 — mixed (qualifying + non-qualifying)</h2>
+<p>CSV: schema <code>sa_mixed</code> (one clean, one table-ENABLE), schema <code>sa_on</code> (ENABLE),
+catalog <code>po_e2e_cat_b</code> (ENABLE), table <code>po_e2e_clean.t_single</code> (clean).
+<b>Expected:</b> clean tables queued, offenders blocked, step still fails.</p>
+<table>
+  <tr><th>Source table</th><th>Outcome</th></tr>
+  <tr><td><code>sa_mixed.t_m_ok</code></td><td><span class="pill p-queue">QUEUED</span></td></tr>
+  <tr><td><code>po_e2e_clean.t_single</code></td><td><span class="pill p-queue">QUEUED</span></td></tr>
+  <tr><td><code>sa_mixed.t_m_on</code></td><td><span class="pill p-block">PO_BLOCKED</span> (TABLE)</td></tr>
+  <tr><td><code>sa_on.t_sch1</code> / <code>sa_on.t_sch2</code></td><td><span class="pill p-block">PO_BLOCKED</span> (SCHEMA)</td></tr>
+  <tr><td><code>sb.t_b1</code> / <code>sb.t_b2</code></td><td><span class="pill p-block">PO_BLOCKED</span> (CATALOG)</td></tr>
+</table>
+<p><b>Observed:</b> <code>total=7 inserted(QUEUED)=2 po_blocked=5 failed=0</code>; step fails after recording. <span class="pass">PASS</span>
+— confirms the chosen "queue the clean, block offenders, then fail" policy.</p>
+
+<h2>4. Scenario 3 — all pass &rarr; full Deep Clone + validate</h2>
+<p>CSV: catalog <code>po_e2e_cat_c</code>, schema <code>sa_ok</code>, table <code>po_e2e_clean.t_single</code> (all PO-disabled).
+<b>Expected:</b> all queued, chunked, Deep Cloned, row counts validated, process completes.</p>
+<table>
+  <tr><th>Source &rarr; Target</th><th>src rows</th><th>tgt rows</th><th>Validation</th></tr>
+  <tr><td><code>sc1.t_c1a</code> &rarr; <code>po_e2e_tgt.sc1.t_c1a</code></td><td>8</td><td>8</td><td class="pass">MATCH</td></tr>
+  <tr><td><code>sc1.t_c1b</code> &rarr; <code>po_e2e_tgt.sc1.t_c1b</code></td><td>9</td><td>9</td><td class="pass">MATCH</td></tr>
+  <tr><td><code>sa_ok.t_a1</code> &rarr; <code>po_e2e_tgt.sa_ok.t_a1</code></td><td>5</td><td>5</td><td class="pass">MATCH</td></tr>
+  <tr><td><code>sa_ok.t_a2</code> &rarr; <code>po_e2e_tgt.sa_ok.t_a2</code></td><td>7</td><td>7</td><td class="pass">MATCH</td></tr>
+  <tr><td><code>po_e2e_clean.t_single</code> &rarr; <code>po_e2e_tgt.po_e2e_clean.t_single</code></td><td>10</td><td>10</td><td class="pass">MATCH</td></tr>
+</table>
+<p><b>Observed:</b> <code>total=5 inserted(QUEUED)=5 po_blocked=0</code> &rarr; planned <b>1 chunk (5 tables)</b> &rarr;
+<code>CREATE OR REPLACE TABLE … DEEP CLONE …</code> executed &rarr; <b>5/5 row-count matches</b>, all marked
+<code>COMPLETED</code> / <code>VALIDATED</code>. <span class="pass">PASS</span> — clean selections flow end-to-end unchanged.</p>
+
+<h2>5. Unit regression suite</h2>
+<pre>$ python3 -m pytest tests/ -q
+......................................................................  [100%]
+70 passed, 1 warning in 1.93s</pre>
+<ul>
+  <li><b>10</b> PO-specific tests — flag parsing (ENABLE / DISABLE / INHERIT / missing / API-error fail-closed),
+      parallel <code>check_selections</code>, and <code>InventoryManager</code> integration.</li>
+  <li><b>60</b> pre-existing orchestrator tests — all still green (no regressions).</li>
+  <li>Excluded: 3 modules that require the Databricks <code>dbutils</code> runtime and 1 notebook with a
+      pre-existing Python-3.9 f-string syntax quirk — unrelated to this change.</li>
+</ul>
+
+<h2>6. Coverage summary</h2>
+<table>
+  <tr><th>Capability</th><th>Verified by</th><th>Result</th></tr>
+  <tr><td>Table-level PO detected</td><td>S1/S2 (<code>t_m_on</code>)</td><td class="pass">PASS</td></tr>
+  <tr><td>Schema-level inheritance detected</td><td>S1/S2 (<code>sa_on</code>)</td><td class="pass">PASS</td></tr>
+  <tr><td>Catalog-level inheritance detected</td><td>S1/S2 (<code>po_e2e_cat_b</code>)</td><td class="pass">PASS</td></tr>
+  <tr><td>Clean tables still queue</td><td>S2/S3</td><td class="pass">PASS</td></tr>
+  <tr><td>Offenders recorded as <code>PO_BLOCKED</code> + error_code</td><td>S1/S2 control-table rows</td><td class="pass">PASS</td></tr>
+  <tr><td>Step fails when any offender present</td><td>S1/S2</td><td class="pass">PASS</td></tr>
+  <tr><td>Parallelism preserved (no sequential pass)</td><td>4-thread inventory worker</td><td class="pass">PASS</td></tr>
+  <tr><td>CSV-driven across catalog/schema/table rows</td><td>all 3 scenarios</td><td class="pass">PASS</td></tr>
+  <tr><td>Deep Clone + row-count validation on clean set</td><td>S3</td><td class="pass">PASS</td></tr>
+  <tr><td>Fail-closed on unreadable PO state</td><td>unit test</td><td class="pass">PASS</td></tr>
+</table>
+
+<p class="foot">Regression evidence captured from live runs against vk-west on Oct 21, 2026. Fixtures are isolated under
+<code>po_e2e_*</code> catalogs and <code>po_ctl_t2</code> and can be dropped after review.</p>
+</body></html>

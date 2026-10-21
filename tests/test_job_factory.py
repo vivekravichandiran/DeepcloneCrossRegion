@@ -4,7 +4,7 @@ builder behind notebooks/create_jobs_notebook.py (the DAB-equivalent
 "create jobs from a notebook" flow).
 
 Covers:
-  1. All 7 DAB jobs are built, with the correct names + `[<target>]` suffix.
+  1. All 7 DAB jobs are built, with the correct names (no deploy-env suffix).
   2. Deploy-time substitution: notebook paths come from workspace_file_path;
      job-parameter DEFAULTS come from the resolved var values.
   3. Task `base_parameters` keep the DAB's `{{job.parameters.*}}` templating
@@ -69,13 +69,13 @@ def specs(params):
 
 
 EXPECTED_NAMES = [
-    "DeepClone 0 - Setup Control Tables [prod]",
-    "DeepClone 1 - INVENTORY [prod]",
-    "DeepClone 2 - DRY_RUN [prod]",
-    "DeepClone 3 - DEEP_CLONE [prod]",
-    "DeepClone 4 - VALIDATE [prod]",
-    "DeepClone 5 - RETRY [prod]",
-    "DeepClone - Full Migration Workflow [prod]",
+    "DeepClone 0 - Setup Control Tables",
+    "DeepClone 1 - INVENTORY",
+    "DeepClone 2 - DRY_RUN",
+    "DeepClone 3 - DEEP_CLONE",
+    "DeepClone 4 - VALIDATE",
+    "DeepClone 5 - RETRY",
+    "DeepClone - Full Migration Workflow",
 ]
 
 
@@ -86,7 +86,9 @@ def test_all_seven_jobs_built(specs):
     assert list(specs.keys()) == EXPECTED_NAMES
 
 
-def test_target_suffix_applied():
+def test_no_env_suffix_in_job_names():
+    # Client production jobs must NOT carry any deploy-env reference in the name
+    # (no "[prod]" / "[dev]" / "[...]" suffix), regardless of bundle_target.
     s = build_all_job_specs({
         "bundle_target": "dev",
         "workspace_file_path": FILE_ROOT,
@@ -95,20 +97,21 @@ def test_target_suffix_applied():
         "setup_notebook": f"{FILE_ROOT}/notebooks/setup_control_tables",
         "target_warehouse_id": "wh_x",
     })
-    assert all(name.endswith("[dev]") for name in s)
+    assert all("[" not in name and "]" not in name for name in s)
+    assert "DeepClone 1 - INVENTORY" in s
 
 
 # ── 2. Deploy-time substitution ──────────────────────────────────────────────
 
 def test_notebook_paths_from_file_root(specs):
-    inv = specs["DeepClone 1 - INVENTORY [prod]"]
+    inv = specs["DeepClone 1 - INVENTORY"]
     assert inv["tasks"][0]["notebook_task"]["notebook_path"] == f"{FILE_ROOT}/notebooks/orchestrator_notebook"
-    setup = specs["DeepClone 0 - Setup Control Tables [prod]"]
+    setup = specs["DeepClone 0 - Setup Control Tables"]
     assert setup["tasks"][0]["notebook_task"]["notebook_path"] == f"{FILE_ROOT}/notebooks/setup_control_tables"
 
 
 def test_param_defaults_resolved(specs):
-    inv = specs["DeepClone 1 - INVENTORY [prod]"]
+    inv = specs["DeepClone 1 - INVENTORY"]
     pmap = {p["name"]: p["default"] for p in inv["parameters"]}
     assert pmap["clone_type"] == "delta_share"
     assert pmap["meta_catalog"] == "ril_migration_catalog"
@@ -122,7 +125,7 @@ def test_param_defaults_resolved(specs):
 # ── 3. Templating preserved (not eagerly resolved) ───────────────────────────
 
 def test_base_parameters_keep_job_parameter_templating(specs):
-    inv_bp = specs["DeepClone 1 - INVENTORY [prod]"]["tasks"][0]["notebook_task"]["base_parameters"]
+    inv_bp = specs["DeepClone 1 - INVENTORY"]["tasks"][0]["notebook_task"]["base_parameters"]
     assert inv_bp["mode"] == "INVENTORY"
     assert inv_bp["clone_type"] == "{{job.parameters.clone_type}}"
     assert inv_bp["meta_catalog"] == "{{job.parameters.meta_catalog}}"
@@ -132,7 +135,7 @@ def test_base_parameters_keep_job_parameter_templating(specs):
 # ── 4. Full workflow structure ───────────────────────────────────────────────
 
 def test_workflow_task_chain(specs):
-    wf = specs["DeepClone - Full Migration Workflow [prod]"]
+    wf = specs["DeepClone - Full Migration Workflow"]
     tasks = {t["task_key"]: t for t in wf["tasks"]}
     assert set(tasks) == {"inventory", "dry_run", "deep_clone", "retry", "validate"}
     # dependency chain: inventory <- deep_clone <- retry <- validate
@@ -144,7 +147,7 @@ def test_workflow_task_chain(specs):
 
 
 def test_workflow_batch_id_taskvalue_wiring(specs):
-    wf = specs["DeepClone - Full Migration Workflow [prod]"]
+    wf = specs["DeepClone - Full Migration Workflow"]
     tasks = {t["task_key"]: t for t in wf["tasks"]}
     # inventory reads the raw job parameter; downstream read inventory's task value
     assert tasks["inventory"]["notebook_task"]["base_parameters"]["batch_id"] == "{{job.parameters.batch_id}}"
@@ -153,7 +156,7 @@ def test_workflow_batch_id_taskvalue_wiring(specs):
 
 
 def test_workflow_has_health_rule(specs):
-    wf = specs["DeepClone - Full Migration Workflow [prod]"]
+    wf = specs["DeepClone - Full Migration Workflow"]
     assert wf["health"]["rules"][0]["metric"] == "RUN_DURATION_SECONDS"
     assert wf["health"]["rules"][0]["value"] == 86400
 
@@ -174,7 +177,7 @@ def test_worker_cluster_json_is_runtime_templated(specs):
     {{job.parameters.*}} templates so the pool / VM type / worker count / Spark
     version are overridable from the 'Run now' panel. The notebook resolves the
     pool-vs-node choice at run time (Databricks rejects a spec with both)."""
-    dc = specs["DeepClone 3 - DEEP_CLONE [prod]"]
+    dc = specs["DeepClone 3 - DEEP_CLONE"]
     wcj = dc["tasks"][0]["notebook_task"]["base_parameters"]["worker_cluster_json"]
     parsed = json.loads(wcj)   # must still be a valid JSON *string*
     assert parsed["spark_version"] == "{{job.parameters.worker_spark_version}}"
@@ -195,9 +198,9 @@ def test_worker_compute_exposed_as_job_parameters(specs):
         "worker_num_workers": "8",
     }
     for job_name in (
-        "DeepClone 3 - DEEP_CLONE [prod]",
-        "DeepClone 5 - RETRY [prod]",
-        "DeepClone - Full Migration Workflow [prod]",
+        "DeepClone 3 - DEEP_CLONE",
+        "DeepClone 5 - RETRY",
+        "DeepClone - Full Migration Workflow",
     ):
         spec = specs[job_name]
         got = {pp["name"]: pp["default"] for pp in spec["parameters"]}
@@ -218,7 +221,7 @@ def test_specs_are_json_serialisable(specs):
 
 
 def test_as_reset_body_wraps_settings(specs):
-    setup = specs["DeepClone 0 - Setup Control Tables [prod]"]
+    setup = specs["DeepClone 0 - Setup Control Tables"]
     body = as_reset_body(4242, setup)
     assert body["job_id"] == 4242
     assert body["new_settings"]["name"] == setup["name"]
@@ -247,7 +250,7 @@ def test_standalone_clone_and_retry_drop_source_warehouse_and_default_worker_nb(
     # longer expose source_warehouse_id or worker_notebook_path as job params;
     # worker_notebook_path is the resolved deployed path (a literal).
     expected_nb = f"{FILE_ROOT}/notebooks/chunk_worker_notebook"
-    for name in ("DeepClone 3 - DEEP_CLONE [prod]", "DeepClone 5 - RETRY [prod]"):
+    for name in ("DeepClone 3 - DEEP_CLONE", "DeepClone 5 - RETRY"):
         pnames = {p["name"] for p in specs[name]["parameters"]}
         assert "source_warehouse_id" not in pnames, name
         assert "worker_notebook_path" not in pnames, name
@@ -261,7 +264,7 @@ def test_retry_permanent_job_param_present_and_default_false(specs):
     # OPT-IN FAILED_PERMANENT re-drive: the RETRY job and the Full Workflow job
     # must both expose a `retry_permanent` job parameter, defaulted "false" so
     # the safe terminal semantics are unchanged unless explicitly overridden.
-    for name in ("DeepClone 5 - RETRY [prod]", "DeepClone - Full Migration Workflow [prod]"):
+    for name in ("DeepClone 5 - RETRY", "DeepClone - Full Migration Workflow"):
         pmap = {p["name"]: p["default"] for p in specs[name]["parameters"]}
         assert "retry_permanent" in pmap, name
         assert pmap["retry_permanent"] == "false", name
@@ -271,10 +274,10 @@ def test_retry_permanent_wired_into_retry_base_parameters(specs):
     # The RETRY task on both jobs must forward the job parameter into the
     # notebook via {{job.parameters.retry_permanent}} templating (not eagerly
     # resolved), exactly like max_retries.
-    retry_bp = specs["DeepClone 5 - RETRY [prod]"]["tasks"][0]["notebook_task"]["base_parameters"]
+    retry_bp = specs["DeepClone 5 - RETRY"]["tasks"][0]["notebook_task"]["base_parameters"]
     assert retry_bp["retry_permanent"] == "{{job.parameters.retry_permanent}}"
 
-    wf = specs["DeepClone - Full Migration Workflow [prod]"]
+    wf = specs["DeepClone - Full Migration Workflow"]
     wf_retry = {t["task_key"]: t for t in wf["tasks"]}["retry"]
     wf_retry_bp = wf_retry["notebook_task"]["base_parameters"]
     assert wf_retry_bp["retry_permanent"] == "{{job.parameters.retry_permanent}}"
@@ -282,7 +285,7 @@ def test_retry_permanent_wired_into_retry_base_parameters(specs):
 
 def test_workflow_csv_params_removed(specs):
     # CSV-oriented workflow: these are NOT exposed as job parameters anymore.
-    wf = specs["DeepClone - Full Migration Workflow [prod]"]
+    wf = specs["DeepClone - Full Migration Workflow"]
     names = {p["name"] for p in wf["parameters"]}
     for removed in (
         "yaml_config_path", "source_catalogs", "source_schemas", "source_tables",
@@ -297,7 +300,7 @@ def test_workflow_csv_params_removed(specs):
 
 
 def test_workflow_selection_type_hardcoded_in_inventory_and_dry_run(specs):
-    wf = specs["DeepClone - Full Migration Workflow [prod]"]
+    wf = specs["DeepClone - Full Migration Workflow"]
     tasks = {t["task_key"]: t for t in wf["tasks"]}
     for tk in ("inventory", "dry_run"):
         bp = tasks[tk]["notebook_task"]["base_parameters"]
@@ -312,7 +315,7 @@ def test_workflow_selection_type_hardcoded_in_inventory_and_dry_run(specs):
 def test_workflow_worker_notebook_path_hardcoded(specs):
     # worker_notebook_path is now the resolved deployed path (a literal), not a
     # {{job.parameters.*}} template, on both clone-dispatching tasks.
-    wf = specs["DeepClone - Full Migration Workflow [prod]"]
+    wf = specs["DeepClone - Full Migration Workflow"]
     tasks = {t["task_key"]: t for t in wf["tasks"]}
     expected = f"{FILE_ROOT}/notebooks/chunk_worker_notebook"
     for tk in ("deep_clone", "retry"):
@@ -322,7 +325,7 @@ def test_workflow_worker_notebook_path_hardcoded(specs):
 
 
 def test_workflow_validate_drops_source_warehouse(specs):
-    wf = specs["DeepClone - Full Migration Workflow [prod]"]
+    wf = specs["DeepClone - Full Migration Workflow"]
     tasks = {t["task_key"]: t for t in wf["tasks"]}
     val_bp = tasks["validate"]["notebook_task"]["base_parameters"]
     assert "source_warehouse_id" not in val_bp
@@ -347,7 +350,7 @@ def test_all_jobs_drop_csv_irrelevant_params(specs):
 def test_standalone_inventory_and_dry_run_are_csv_oriented(specs):
     # INVENTORY + standalone DRY_RUN drive selection from the CSV: input_type +
     # csv_path present, selection_type hardcoded to 'catalog' in base_parameters.
-    for name in ("DeepClone 1 - INVENTORY [prod]", "DeepClone 2 - DRY_RUN [prod]"):
+    for name in ("DeepClone 1 - INVENTORY", "DeepClone 2 - DRY_RUN"):
         pnames = {p["name"] for p in specs[name]["parameters"]}
         assert "input_type" in pnames, name
         assert "csv_path" in pnames, name
@@ -359,7 +362,7 @@ def test_standalone_inventory_and_dry_run_are_csv_oriented(specs):
 def test_success_email_only_on_deep_clone_and_workflow(specs):
     def has_success(spec):
         return "on_success" in spec["email_notifications"]
-    assert has_success(specs["DeepClone 3 - DEEP_CLONE [prod]"])
-    assert has_success(specs["DeepClone - Full Migration Workflow [prod]"])
-    assert not has_success(specs["DeepClone 1 - INVENTORY [prod]"])
-    assert not has_success(specs["DeepClone 4 - VALIDATE [prod]"])
+    assert has_success(specs["DeepClone 3 - DEEP_CLONE"])
+    assert has_success(specs["DeepClone - Full Migration Workflow"])
+    assert not has_success(specs["DeepClone 1 - INVENTORY"])
+    assert not has_success(specs["DeepClone 4 - VALIDATE"])

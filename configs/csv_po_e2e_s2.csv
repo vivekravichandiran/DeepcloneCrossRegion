@@ -1,0 +1,5 @@
+clone_type,source_catalog,source_schema,source_table,target_catalog,target_schema,target_table,exclude_schemas,exclude_tables
+schema,po_e2e_cat_a,sa_mixed,,po_e2e_tgt,sa_mixed,,,
+schema,po_e2e_cat_a,sa_on,,po_e2e_tgt,sa_on,,,
+catalog,po_e2e_cat_b,,,po_e2e_tgt,,,,
+table,po_ctl_t2,po_e2e_clean,t_single,po_e2e_tgt,po_e2e_clean,t_single,,

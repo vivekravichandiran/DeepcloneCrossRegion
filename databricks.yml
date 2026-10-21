@@ -313,6 +313,33 @@ targets:
       meta_catalog: ril_migration_catalog
       meta_schema: migration_meta
 
+  # ── vk-west: same-workspace self-clone test target (source = target) ─────────
+  # delta_share clone within one metastore. Uses dedicated PRE-WARMED instance
+  # pools in this workspace so there is NO cold start (pools keep min_idle
+  # instances always running and preload the Spark image). Pools govern the
+  # node type, so setup_node_type/worker_node_type are not used here.
+  #   control plane -> deepclone-orchestrator-pool-vkwest (D4s_v3, min_idle=3)
+  #   chunk workers -> deepclone-worker-pool-vkwest       (D4s_v3, min_idle=2)
+  # To drop the standing idle cost, set each pool's min_idle_instances to 0
+  # (reintroduces cold start). These pool IDs exist only in vk-west.
+  vkwest:
+    mode: development
+    workspace:
+      host: https://adb-7405612780454429.9.azuredatabricks.net
+    variables:
+      meta_catalog: po_ctl_t2
+      meta_schema: migration_meta
+      target_warehouse_id: "345e7fb63d50405e"
+      clone_type: delta_share
+      input_type: CSV
+      instance_pool_id: "1021-093621-make48-pool-jpua4vxv"
+      worker_instance_pool_id: "1021-093622-zebra53-pool-6o8zkygj"
+      worker_num_workers: "1"
+      min_executors: "1"
+      max_concurrent_chunks: "2"
+      # Tiny test tables don't pre-exist on the target — let DEEP_CLONE create them
+      require_target_precreated: "false"
+
 # ── Workspace file sync ───────────────────────────────────────────────────────
 workspace:
   root_path: ~/deepclone_orchestrator/${bundle.target}

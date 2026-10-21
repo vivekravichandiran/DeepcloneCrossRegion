@@ -114,8 +114,12 @@ def _merge_defaults(params: Dict[str, Any]) -> Dict[str, Any]:
     return merged
 
 
-def _job_name(base: str, target: str) -> str:
-    return f"{base} [{target}]"
+def _job_name(base: str, target: str = "") -> str:
+    # Job names are intentionally environment-agnostic (NO "[target]" suffix).
+    # These are client production jobs and must not carry any deploy-env
+    # reference (prod/dev/etc.) in their visible name. `target` is accepted for
+    # backward compatibility with callers but is no longer used in the name.
+    return base
 
 
 def _param_list(pairs: List[tuple]) -> List[Dict[str, str]]:

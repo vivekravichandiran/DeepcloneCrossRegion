@@ -68,6 +68,7 @@ class MigrationStatus(str, Enum):
     FAILED_PERMANENT  = "FAILED_PERMANENT"   # exceeded max_attempts or unrecoverable
     RETRY_PENDING     = "RETRY_PENDING"
     SKIPPED           = "SKIPPED"            # non-Delta / view, excluded by pattern
+    PO_BLOCKED        = "PO_BLOCKED"         # source has Predictive Optimization ENABLED (or unconfirmable) at INVENTORY
     # Validation states
     VALIDATED         = "VALIDATED"
     VALIDATION_FAILED = "VALIDATION_FAILED"
@@ -113,12 +114,17 @@ VALID_TRANSITIONS: dict[MigrationStatus, set[MigrationStatus]] = {
     # which re-drives permanently-failed rows back into the retry pipeline.
     MigrationStatus.FAILED_PERMANENT: {MigrationStatus.RETRY_PENDING, MigrationStatus.QUEUED},
     MigrationStatus.SKIPPED:          set(),                                   # terminal
+    # PO_BLOCKED is terminal: set at INVENTORY when the source has Predictive
+    # Optimization enabled. The only way "out" is to disable PO at source and
+    # re-run INVENTORY (force_reonboard), which overwrites the row back to QUEUED.
+    MigrationStatus.PO_BLOCKED:       set(),                                   # terminal
 }
 
 TERMINAL_STATES = {
     MigrationStatus.VALIDATED,
     MigrationStatus.FAILED_PERMANENT,
     MigrationStatus.SKIPPED,
+    MigrationStatus.PO_BLOCKED,
 }
 
 RETRYABLE_STATES = {

@@ -1,7 +1,7 @@
 resources:
   jobs:
     full_migration_workflow:
-      name: "DeepClone - Full Migration Workflow [${bundle.target}]"
+      name: "DeepClone - Full Migration Workflow"
       timeout_seconds: 604800   # 7 days — orchestrator run safety net
       description: |
         End-to-end migration workflow: INVENTORY → DRY_RUN → DEEP_CLONE → VALIDATE → RETRY (if needed).

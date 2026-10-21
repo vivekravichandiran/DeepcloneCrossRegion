@@ -25,4 +25,4 @@ validator         — Post-clone source/target comparison
 retry_manager     — Requeue eligible FAILED / VALIDATION_FAILED records
 """
 
-__version__ = "1.0.0"
+__version__ = "1.9.0"

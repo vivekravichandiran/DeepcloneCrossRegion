@@ -1,7 +1,7 @@
 resources:
   jobs:
     setup_control_tables_job:
-      name: "DeepClone 0 - Setup Control Tables [${bundle.target}]"
+      name: "DeepClone 0 - Setup Control Tables"
       description: "Creates migration_control and migration_attempts Delta tables on the target workspace."
       tags:
         team: deepclone

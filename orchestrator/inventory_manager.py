@@ -44,6 +44,7 @@ from orchestrator.models import (
 from orchestrator.config import OrchestratorConfig
 from orchestrator.sql_client import SqlClient
 from orchestrator.workload_classifier import WorkloadClassifier
+from orchestrator.predictive_optimization import PredictiveOptimizationChecker, POState
 
 log = logging.getLogger(__name__)
 
@@ -91,12 +92,18 @@ class InventoryManager:
         tgt_sql:      SqlClient,   # for control-table reads/writes
         classifier:   WorkloadClassifier,
         run_id:       str,
+        po_checker:   Optional[PredictiveOptimizationChecker] = None,
     ):
         self._cfg       = config
         self._src       = src_sql
         self._tgt       = tgt_sql
         self._cls       = classifier
         self._run_id    = run_id
+        # Predictive Optimization gate (see orchestrator/predictive_optimization.py).
+        # When None (e.g. in unit tests that exercise other logic), the PO check
+        # is skipped entirely. Production always injects one via the orchestrator
+        # notebook so the gate is enforced on every real INVENTORY run.
+        self._po        = po_checker
         self._ctrl      = f"{config.meta_catalog}.{config.meta_schema}.migration_control"
         # Serializes every migration_control MERGE write across parallel
         # INVENTORY worker threads — see module docstring / run_inventory()
@@ -162,6 +169,11 @@ class InventoryManager:
         stats = {
             "total": 0, "inserted": 0, "skipped": 0,
             "skipped_target_missing": 0, "failed": 0, "records": [],
+            # Predictive Optimization gate (see orchestrator/predictive_optimization.py):
+            # po_blocked = count of source tables whose effective PO is ENABLED (or
+            # could not be confirmed disabled). po_blocked_list holds (sel, POState)
+            # so the orchestrator can fail the step with a detailed offender list.
+            "po_blocked": 0, "po_blocked_list": [],
         }
         if not selections:
             return stats
@@ -175,10 +187,23 @@ class InventoryManager:
 
         def _worker(sel: TableSelection):
             try:
+                # ── Predictive Optimization gate (parallel, runs FIRST) ──────
+                # Reuses this same per-table worker thread (no extra sequential
+                # pass). A source table whose effective PO is ENABLED — or whose
+                # PO status can't be confirmed disabled — short-circuits here:
+                # we skip the (now-pointless) DESCRIBE DETAIL and return the
+                # POState so the aggregation records it as PO_BLOCKED and fails
+                # the step. Clean tables fall through to normal onboarding.
+                if self._po is not None:
+                    po = self._po.check(
+                        sel.source_catalog, sel.source_schema, sel.source_table
+                    )
+                    if po.blocked:
+                        return sel, None, False, None, po
                 rec, target_missing = self._process_one(sel, force, require_target_precreated)
-                return sel, rec, target_missing, None
+                return sel, rec, target_missing, None, None
             except Exception as e:
-                return sel, None, False, e
+                return sel, None, False, e, None
 
         # Stats/records aggregation below runs entirely in THIS (the calling)
         # thread, one completed future at a time via as_completed() — so it
@@ -189,9 +214,15 @@ class InventoryManager:
         with ThreadPoolExecutor(max_workers=n_threads, thread_name_prefix="inventory") as executor:
             futures = [executor.submit(_worker, sel) for sel in selections]
             for future in as_completed(futures):
-                sel, rec, target_missing, err = future.result()
+                sel, rec, target_missing, err, po = future.result()
                 stats["total"] += 1
-                if err is not None:
+                if po is not None:
+                    # PO gate tripped for this source table (ENABLED or
+                    # unconfirmable). Record it; it is NOT onboarded as QUEUED.
+                    stats["po_blocked"] += 1
+                    stats["po_blocked_list"].append((sel, po))
+                    log.error("PO gate BLOCKED %s: %s", sel.source_fqn, po.reason)
+                elif err is not None:
                     stats["failed"] += 1
                     log.error("Inventory failed for %s: %s", sel.source_fqn, err)
                     self._mark_permanent_failure(sel, str(err))
@@ -208,8 +239,15 @@ class InventoryManager:
         # commits instead of one commit per table (see _upsert_batch). The
         # reads above ran concurrently; the write is now the only remaining
         # serialized step, and it's a few commits rather than thousands.
+        # Per the "queue clean tables as usual" decision, clean tables are still
+        # onboarded as QUEUED even when some tables are PO_BLOCKED — the
+        # orchestrator raises AFTER inventory/planning so the step fails loudly.
         if stats["records"]:
             self._upsert_batch(stats["records"])
+        # PO_BLOCKED rows are written in their own batched MERGE(s) — can be many
+        # (a whole catalog/schema with PO enabled blocks every table under it).
+        if stats["po_blocked_list"]:
+            self._mark_po_blocked_batch(stats["po_blocked_list"])
         return stats
 
     # ── Per-table logic ───────────────────────────────────────────────────────
@@ -481,6 +519,114 @@ class InventoryManager:
                 self._tgt.execute_ddl(q)
         except Exception as e:
             log.error("Could not record SKIPPED (target missing) for %s: %s", sel.source_fqn, e)
+
+    def _mark_po_blocked_batch(
+        self, blocked: "List[tuple[TableSelection, POState]]", batch_size: int = 200,
+    ) -> None:
+        """
+        Record every PO-blocked source table into migration_control with
+        status=PO_BLOCKED and error_code=PREDICTIVE_OPTIMIZATION_ENABLED /
+        PREDICTIVE_OPTIMIZATION_UNKNOWN (see predictive_optimization.POState).
+
+        Batched (like _upsert_batch) because a catalog/schema with PO enabled
+        blocks EVERY table under it — potentially thousands — so a per-row
+        commit would reintroduce the exact slowness _upsert_batch was built to
+        avoid. Same batch_id-scoped identity key and stale-state reset as the
+        other MERGE paths. PO_BLOCKED is terminal and never status='QUEUED', so
+        DEEP_CLONE/RETRY never pick these rows up.
+        """
+        if not blocked:
+            return
+        now = _TS()
+        batch_id_val = (getattr(self._cfg, "batch_id", "") or "").replace("'", "\\'")
+        total = len(blocked)
+        n_batches = (total + batch_size - 1) // batch_size
+        log.info(
+            "INVENTORY: writing %d PO_BLOCKED record(s) to migration_control in %d MERGE(s)",
+            total, n_batches,
+        )
+
+        def _row(sel: TableSelection, po: POState) -> str:
+            mid = str(uuid.uuid4())
+            ec  = (po.error_code or "PREDICTIVE_OPTIMIZATION_ENABLED")
+            em  = (po.reason or "")
+            return (
+                "("
+                f"{_sql_str(mid)}, {_sql_str(self._run_id)}, {_sql_str(self._cfg.clone_type)}, "
+                f"{_sql_str(self._cfg.source_workspace_url)}, {_sql_str(self._cfg.target_workspace_url)}, "
+                f"{_sql_str(sel.source_catalog)}, {_sql_str(sel.source_schema)}, {_sql_str(sel.source_table)}, "
+                f"{_sql_str(sel.target_catalog)}, {_sql_str(sel.target_schema)}, {_sql_str(sel.target_table)}, "
+                f"{_sql_str(batch_id_val)}, 'PO_BLOCKED', {_sql_str(ec)}, {_sql_str(em[:500])}, "
+                f"{_sql_str(now)}, {_sql_str(now)}, {_sql_str(now)}"
+                ")"
+            )
+
+        cols = (
+            "mid, run_id, clone_type, source_workspace, target_workspace, "
+            "sc, ss, st, target_catalog, target_schema, target_table, "
+            "bid, status, error_code, error_message, discovered_at, created_at, updated_at"
+        )
+        for i in range(0, total, batch_size):
+            chunk = blocked[i:i + batch_size]
+            values = ",\n              ".join(_row(sel, po) for sel, po in chunk)
+            q = f"""
+        MERGE INTO {self._ctrl} AS t
+        USING (
+          SELECT
+            CAST(mid AS STRING) AS mid, CAST(run_id AS STRING) AS run_id,
+            CAST(clone_type AS STRING) AS clone_type,
+            CAST(source_workspace AS STRING) AS source_workspace,
+            CAST(target_workspace AS STRING) AS target_workspace,
+            CAST(sc AS STRING) AS sc, CAST(ss AS STRING) AS ss, CAST(st AS STRING) AS st,
+            CAST(target_catalog AS STRING) AS target_catalog,
+            CAST(target_schema AS STRING) AS target_schema,
+            CAST(target_table AS STRING) AS target_table,
+            CAST(bid AS STRING) AS bid, CAST(status AS STRING) AS status,
+            CAST(error_code AS STRING) AS error_code,
+            CAST(error_message AS STRING) AS error_message,
+            CAST(discovered_at AS TIMESTAMP) AS discovered_at,
+            CAST(created_at AS TIMESTAMP) AS created_at,
+            CAST(updated_at AS TIMESTAMP) AS updated_at
+          FROM (VALUES
+              {values}
+          ) AS v({cols})
+        ) AS s
+        ON t.source_catalog = s.sc AND t.source_schema = s.ss
+           AND t.source_table = s.st AND t.batch_id = s.bid
+        WHEN MATCHED THEN UPDATE SET
+          run_id            = s.run_id,
+          status            = s.status,
+          error_code        = s.error_code,
+          error_message     = s.error_message,
+          target_catalog    = s.target_catalog,
+          target_schema     = s.target_schema,
+          target_table      = s.target_table,
+          batch_id          = s.bid,
+          started_at        = NULL,
+          completed_at      = NULL,
+          failed_at         = NULL,
+          validation_status = NULL,
+          source_row_count  = NULL,
+          target_row_count  = NULL,
+          updated_at        = s.updated_at
+        WHEN NOT MATCHED THEN INSERT (
+          migration_id, run_id, clone_type,
+          source_workspace, target_workspace,
+          source_catalog, source_schema, source_table,
+          target_catalog, target_schema, target_table,
+          batch_id, status, error_code, error_message,
+          discovered_at, created_at, updated_at
+        ) VALUES (
+          s.mid, s.run_id, s.clone_type,
+          s.source_workspace, s.target_workspace,
+          s.sc, s.ss, s.st,
+          s.target_catalog, s.target_schema, s.target_table,
+          s.bid, s.status, s.error_code, s.error_message,
+          s.discovered_at, s.created_at, s.updated_at
+        )
+        """
+            with self._write_lock:
+                self._tgt.execute_ddl(q)
 
     # ── Control table operations ──────────────────────────────────────────────
 

@@ -1,7 +1,7 @@
 resources:
   jobs:
     deep_clone_job:
-      name: "DeepClone 3 - DEEP_CLONE [${bundle.target}]"
+      name: "DeepClone 3 - DEEP_CLONE"
       timeout_seconds: 604800   # 7 days — orchestrator run safety net
       description: "Executes DEEP CLONE for all QUEUED tables in migration_control."
       tags:

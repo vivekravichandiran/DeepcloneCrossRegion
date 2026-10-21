@@ -1,7 +1,7 @@
 resources:
   jobs:
     dry_run_job:
-      name: "DeepClone 2 - DRY_RUN [${bundle.target}]"
+      name: "DeepClone 2 - DRY_RUN"
       timeout_seconds: 604800   # 7 days — orchestrator run safety net
       description: "Resolves table scope and prints execution plan — no data is moved."
       tags:

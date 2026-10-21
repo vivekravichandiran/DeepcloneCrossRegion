@@ -11,6 +11,76 @@ and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2
 > heading (most recent first), with the date and the files touched. Keep entries
 > concise and factual.
 
+## [1.9.0] - 2026-10-21
+
+### Added
+- **Predictive Optimization (PO) inventory gate.** Before any table is onboarded,
+  INVENTORY (and DRY_RUN) now verifies that Unity Catalog Predictive Optimization
+  is **disabled** on the source table. The check reads the UC *effective* PO flag
+  (`effective_predictive_optimization_flag.value`), so catalog-, schema-, and
+  table-level inheritance are all resolved in a single GET per table. A table
+  whose PO is **ENABLED** — or whose PO state is **unreadable** (fail-closed) — is
+  recorded as `PO_BLOCKED` (never `QUEUED`) and the step then fails. Clean tables
+  are still queued. The check runs inside the existing inventory
+  `ThreadPoolExecutor` parallelism (no new sequential pass) and is fully
+  CSV-driven (no new widgets). Applies at any selection level (catalog/schema/table).
+  - `orchestrator/predictive_optimization.py` (**NEW**): `PredictiveOptimizationChecker.check()`,
+    `POState` dataclass, and parallel `check_selections()` for DRY_RUN. Fail-closed on API error.
+  - `orchestrator/api_client.py`: new `unity_catalog_get(kind, full_name)` — URL-safe single-securable GET.
+  - `orchestrator/models.py`: new terminal status `MigrationStatus.PO_BLOCKED` (added to
+    `TERMINAL_STATES` and `VALID_TRANSITIONS` — never retried, never dispatched).
+  - `orchestrator/inventory_manager.py`: per-table PO check runs first; aggregation splits
+    clean vs blocked; new batched `_mark_po_blocked_batch()` MERGE; stats gain `po_blocked` /
+    `po_blocked_list`.
+  - `notebooks/orchestrator_notebook.py`: builds the checker, wires it into `InventoryManager`;
+    DRY_RUN pre-checks and raises; INVENTORY raises `RuntimeError` after planning when `po_blocked > 0`.
+  - `notebooks/setup_control_tables.py`: status documentation includes `PO_BLOCKED`.
+  - `tests/test_predictive_optimization.py` (**NEW**): 10 unit tests (flag parsing
+    enable/disable/inherit/missing/error, parallel `check_selections`, `InventoryManager` integration).
+  - Docs: `docs/PO_Inventory_Gate_Design.(md|html|pdf)` and
+    `docs/PO_Inventory_Gate_Regression_Report.(md|html|pdf)`.
+  - **Live-tested end-to-end in vk-west** (same-workspace `delta_share`) via the Full Migration
+    Workflow job: S1 all-PO-enabled → inventory fails (5 `PO_BLOCKED`, 0 queued); S2 mixed →
+    inventory fails (5 `PO_BLOCKED` + 2 clean `QUEUED`); S3 all-clean → INVENTORY → DEEP_CLONE
+    → VALIDATE complete (5/5 tables `VALIDATED`, src == tgt row counts). Full unit suite: 70 passed.
+- **vk-west deployment target + pre-warmed instance pools (no cold start).**
+  - `databricks.yml`: new `vkwest` target — same-workspace source = target, `clone_type: delta_share`,
+    control tables `po_ctl_t2.migration_meta`, warehouse `345e7fb63d50405e`. Points the control-plane
+    at `deepclone-orchestrator-pool-vkwest` (Standard_D4s_v3, min_idle=3) and chunk workers at
+    `deepclone-worker-pool-vkwest` (Standard_D4s_v3, min_idle=2), both created in vk-west.
+  - Scenario fixtures: `configs/csv_po_e2e_s1.csv`, `configs/csv_po_e2e_s2.csv`, `configs/csv_po_e2e_s3.csv`.
+- **Chunk-worker pool widget in the in-workspace job creator.**
+  `notebooks/create_jobs_notebook.py`: added a `worker_instance_pool_id` widget (the wrapper
+  previously exposed only the orchestrator `instance_pool_id`), so the chunk-worker pool is
+  settable when creating jobs from the notebook.
+
+### Changed
+- **Job names are now environment-agnostic (no `[target]` suffix).** Client production jobs are
+  named `DeepClone 1 - INVENTORY`, `DeepClone - Full Migration Workflow`, etc. — the previous
+  `... [prod]` / `... [${bundle.target}]` suffix has been removed from both job-creation paths.
+  - `orchestrator/job_factory.py`: `_job_name()` no longer appends `[target]` (arg kept for
+    backward compatibility, now unused).
+  - `resources/00_setup_control_tables.yml` … `resources/06_full_migration_workflow.yml`:
+    `name:` lines drop the `[${bundle.target}]` suffix.
+  - `tests/test_job_factory.py`: expected names updated; `test_target_suffix_applied` replaced by
+    `test_no_env_suffix_in_job_names` (asserts no `[...]` in any job name). 24 tests pass.
+
+## [1.8.1] - 2026-10-21
+
+### Changed
+- **Raised per-chunk and orchestrator run timeouts to 7 days** (previously 3h per chunk / 1d run)
+  so long-running DEEP CLONE chunks are no longer killed mid-copy; a re-run resumes from where it
+  left off (deep clone is restartable). Pure config change.
+  - `orchestrator/config.py`: `worker_timeout_minutes` 180 → 10080 (7 days).
+  - `configs/migration.yaml`: `worker_timeout_minutes: 10080`.
+  - `orchestrator/api_client.py`: `submit_worker_run` default `timeout_minutes=10080`;
+    `poll_run_until_done` default `timeout_s=604800`.
+  - `resources/01..06_*.yml`: `timeout_seconds: 604800` on each job; workflow `RUN_DURATION_SECONDS`
+    health alert raised to 604800.
+  - Committed in `b737e00`; documented here per the changelog convention.
+  - **Known follow-up:** `stale_threshold_minutes = 120` is now far below the 7-day worker timeout —
+    revisit so long-running chunks are not prematurely reconciled/re-dispatched.
+
 ## [1.8.0] - 2026-09-24
 
 ### Added

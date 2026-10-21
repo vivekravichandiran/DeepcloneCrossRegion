@@ -76,6 +76,35 @@ class ApiClient:
             raise ApiError(r.status_code, path, r.text)
         return r.json()
 
+    # ── Unity Catalog — single-object GET (catalog/schema/table) ───────────────
+
+    def unity_catalog_get(self, kind: str, full_name: str) -> Dict:
+        """
+        GET a single Unity Catalog securable by its full name.
+
+        kind:      "catalogs" | "schemas" | "tables"
+        full_name: "<catalog>"                         (catalogs)
+                   "<catalog>.<schema>"                (schemas)
+                   "<catalog>.<schema>.<table>"        (tables)
+
+        Returns the raw UC object JSON, which includes (among other fields):
+          • enable_predictive_optimization            — this object's OWN
+            setting: "ENABLE" | "DISABLE" | "INHERIT".
+          • effective_predictive_optimization_flag    — the RESOLVED setting
+            after inheritance: {"value": "ENABLE"|"DISABLE",
+            "inherited_from_type": "CATALOG"|"SCHEMA",  (present only when
+            "inherited_from_name": "<name>"}             the value is inherited)
+
+        Verified live against the UC REST API (2.1): a single table-level GET
+        already returns the fully-resolved effective flag (catalog→schema→table
+        inheritance resolved server-side), so no manual hierarchy walk is
+        needed. The name is URL-escaped but dots are preserved as path
+        separators between the catalog/schema/table components.
+        """
+        from urllib.parse import quote
+        safe = quote(full_name, safe=".")
+        return self._get(f"/api/2.1/unity-catalog/{kind}/{safe}")
+
     # ── Unity Catalog — Tables API ────────────────────────────────────────────
 
     def list_schemas(self, catalog_name: str) -> List[Dict]:

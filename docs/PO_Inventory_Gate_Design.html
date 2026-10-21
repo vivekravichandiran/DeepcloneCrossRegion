@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<title>Predictive Optimization Inventory Gate — Design</title>
+<style>
+  @page { size: A4; margin: 18mm 16mm; }
+  * { box-sizing: border-box; }
+  body { font-family: -apple-system, "Helvetica Neue", Arial, sans-serif; color: #1a1f29;
+         font-size: 11.2px; line-height: 1.55; margin: 0; }
+  h1 { font-size: 23px; margin: 0 0 2px; color: #0b2a4a; }
+  h2 { font-size: 15px; margin: 22px 0 8px; color: #0b2a4a;
+       border-bottom: 2px solid #d7e3ef; padding-bottom: 4px; }
+  h3 { font-size: 12.5px; margin: 14px 0 5px; color: #14477d; }
+  .sub { color: #5a6b80; font-size: 11px; margin: 0 0 4px; }
+  .meta { color: #7a8aa0; font-size: 10px; margin-bottom: 12px; }
+  code { background: #f1f5fa; border: 1px solid #e0e8f2; border-radius: 3px;
+         padding: 0.5px 4px; font-family: "SF Mono", Menlo, monospace; font-size: 10px; }
+  pre { background: #0f1b2d; color: #e8eef7; padding: 10px 12px; border-radius: 6px;
+        font-family: "SF Mono", Menlo, monospace; font-size: 9.6px; line-height: 1.45;
+        overflow-x: auto; white-space: pre-wrap; }
+  table { border-collapse: collapse; width: 100%; margin: 8px 0; font-size: 10.2px; }
+  th { background: #0b2a4a; color: #fff; text-align: left; padding: 6px 8px; font-weight: 600; }
+  td { border: 1px solid #dde6f0; padding: 5px 8px; vertical-align: top; }
+  tr:nth-child(even) td { background: #f7fafd; }
+  .tag { display: inline-block; padding: 1px 7px; border-radius: 10px; font-size: 9.2px;
+         font-weight: 700; letter-spacing: .3px; }
+  .t-new { background: #e4f7ea; color: #1b7a3d; }
+  .t-mod { background: #fff2d9; color: #9a6a00; }
+  .callout { background: #f3f8ff; border-left: 4px solid #2f74c0; padding: 9px 12px;
+             border-radius: 0 5px 5px 0; margin: 10px 0; }
+  .warn { background: #fff6ec; border-left: 4px solid #e08a1e; }
+  ul { margin: 5px 0 5px 0; padding-left: 20px; }
+  li { margin: 2px 0; }
+  .flow { font-family: "SF Mono", Menlo, monospace; font-size: 9.4px; background: #f7fafd;
+          border: 1px solid #dde6f0; border-radius: 6px; padding: 12px; white-space: pre; }
+  .foot { margin-top: 26px; color: #8493a6; font-size: 9px; border-top: 1px solid #e0e8f2; padding-top: 6px; }
+</style></head><body>
+
+<h1>Predictive Optimization Inventory Gate</h1>
+<p class="sub">Design &amp; Change Specification — Deep Clone Cross-Region Migration Orchestrator</p>
+<p class="meta">Status: Implemented &amp; live-tested (vk-west) &nbsp;•&nbsp; Date: Oct 21, 2026 &nbsp;•&nbsp; Scope: INVENTORY + DRY_RUN modes</p>
+
+<h2>1. Objective</h2>
+<p>Before any table is onboarded for a Deep Clone migration, the orchestrator must verify that
+<b>Unity Catalog Predictive Optimization (PO) is disabled</b> for that source table. If PO is
+<b>enabled</b> at <i>any</i> inherited level (account&rarr;catalog&rarr;schema&rarr;table), the table must not
+be queued: its state is recorded in the inventory/control table and the inventory step fails.
+The check is <b>fully automatic</b> (driven by the input CSV, no new widgets), applies to every
+selection level (catalog, schema, or table rows), and runs under the <b>existing parallelism</b>
+model — no new sequential bottleneck.</p>
+
+<h2>2. Why this is needed</h2>
+<p>Predictive Optimization runs background <code>OPTIMIZE</code> / <code>VACUUM</code> operations on the source.
+Those commits race with the Deep Clone snapshot read and are a primary trigger of the
+<code>DELTA_CONCURRENT_WRITE</code> / <code>ConcurrentWriteException</code> failures seen in production chunk jobs.
+Gating onboarding on "PO disabled" removes that class of failure at the source, before compute is ever spent.</p>
+
+<h2>3. How PO is detected (API verified live first)</h2>
+<p>Before writing any code, the UC REST API behaviour was confirmed against three live fixtures in
+vk-west (catalog-, schema-, and table-level settings). A <b>single</b> GET per table is sufficient —
+Unity Catalog resolves the full inheritance chain for us:</p>
+<pre>GET /api/2.1/unity-catalog/tables/{catalog}.{schema}.{table}
+
+  enable_predictive_optimization            &rarr; this object's OWN setting (ENABLE|DISABLE|INHERIT)
+  effective_predictive_optimization_flag {
+      value               : "ENABLE" | "DISABLE"      &larr; fully resolved, authoritative
+      inherited_from_type : "CATALOG" | "SCHEMA" | null
+      inherited_from_name : "&lt;name of the object the setting came from&gt;"
+  }</pre>
+<div class="callout"><b>Key simplification from the live probe:</b> because <code>effective_predictive_optimization_flag.value</code>
+already reflects inheritance, we do <b>not</b> need to walk or cache the catalog/schema tiers. One call
+per table — which also fits the existing per-table parallel inventory worker cleanly.</div>
+
+<h2>4. Decision mapping</h2>
+<table>
+  <tr><th>Effective value</th><th>Outcome</th><th>Recorded</th></tr>
+  <tr><td><code>DISABLE</code></td><td>Allowed &rarr; table proceeds to <code>QUEUED</code></td><td>normal inventory record</td></tr>
+  <tr><td><code>ENABLE</code></td><td><b>Blocked</b></td><td><code>status=PO_BLOCKED</code>, <code>error_code=PREDICTIVE_OPTIMIZATION_ENABLED</code>, level + source object in message</td></tr>
+  <tr><td>unreadable / API error</td><td><b>Blocked (fail-closed)</b></td><td><code>status=PO_BLOCKED</code>, <code>error_code=PREDICTIVE_OPTIMIZATION_UNKNOWN</code></td></tr>
+</table>
+
+<h2>5. Confirmed design decisions</h2>
+<table>
+  <tr><th>Decision</th><th>Choice</th><th>Rationale</th></tr>
+  <tr><td>Blocked-table state</td><td>New terminal status <code>PO_BLOCKED</code></td><td>Distinct from <code>FAILED</code>; auditable, not retried, not re-dispatched.</td></tr>
+  <tr><td>Scope when offenders exist</td><td><b>Queue the clean tables</b>, block only offenders, then fail the step</td><td>No partial silent success; operators see exactly what passed and what to fix.</td></tr>
+  <tr><td>DRY_RUN behaviour</td><td>Fail the dry run if any selection is PO-enabled</td><td>Dry run is the pre-flight; it must surface blockers before a real run.</td></tr>
+  <tr><td>Unreadable PO status</td><td>Fail closed (treat as blocked)</td><td>Safer to stop than to clone a table whose PO state is unknown.</td></tr>
+</table>
+
+<h2>6. Execution flow (what changed vs the existing procedure)</h2>
+<div class="flow">EXISTING inventory worker (per table, parallel)      NEW inventory worker (per table, parallel)
+--------------------------------------------         -------------------------------------------
+  resolve selection                                    resolve selection
+  classify workload / size                        &gt;&gt;   PO CHECK  (GET effective flag)   &lt;&lt; added, first
+  upsert record as QUEUED                               if ENABLED/UNKNOWN:
+                                                            mark PO_BLOCKED  (batched MERGE)
+                                                            do NOT queue
+                                                         else:
+                                                            classify workload / size
+                                                            upsert record as QUEUED
+--------------------------------------------         -------------------------------------------
+  step always succeeds if rows discovered              step FAILS if any table was PO_BLOCKED</div>
+<p>Everything else — CSV/YAML resolution, chunk planning, batching, Deep Clone dispatch, validation —
+is <b>unchanged</b>. The gate is a new first stage inside the <i>same</i> <code>ThreadPoolExecutor</code> worker; it adds
+no new sequential pass and keeps the configured <code>inventory_parallel_threads</code> concurrency.</p>
+
+<h2>7. Components changed</h2>
+<table>
+  <tr><th>File</th><th>Type</th><th>Change</th></tr>
+  <tr><td><code>orchestrator/predictive_optimization.py</code></td><td><span class="tag t-new">NEW</span></td>
+      <td><code>PredictiveOptimizationChecker</code> (single-table <code>check()</code>), <code>POState</code> dataclass, and
+      <code>check_selections()</code> parallel helper for DRY_RUN. Fail-closed on error.</td></tr>
+  <tr><td><code>orchestrator/api_client.py</code></td><td><span class="tag t-mod">MOD</span></td>
+      <td>Added <code>unity_catalog_get(kind, full_name)</code> — URL-safe single-securable GET.</td></tr>
+  <tr><td><code>orchestrator/models.py</code></td><td><span class="tag t-mod">MOD</span></td>
+      <td>Added <code>PO_BLOCKED</code> to <code>MigrationStatus</code>, to <code>TERMINAL_STATES</code>, and to
+      <code>VALID_TRANSITIONS</code> (terminal — no onward transitions, never retried).</td></tr>
+  <tr><td><code>orchestrator/inventory_manager.py</code></td><td><span class="tag t-mod">MOD</span></td>
+      <td>Worker runs PO check first; aggregation splits clean vs blocked; new
+      <code>_mark_po_blocked_batch()</code> batched MERGE; stats gain <code>po_blocked</code> + <code>po_blocked_list</code>.</td></tr>
+  <tr><td><code>notebooks/orchestrator_notebook.py</code></td><td><span class="tag t-mod">MOD</span></td>
+      <td>Builds the checker; wires it into <code>InventoryManager</code>; DRY_RUN pre-checks &amp; raises; INVENTORY
+      raises <code>RuntimeError</code> after planning when <code>po_blocked &gt; 0</code>.</td></tr>
+  <tr><td><code>notebooks/setup_control_tables.py</code></td><td><span class="tag t-mod">MOD</span></td>
+      <td>Status comment/doc updated to include <code>PO_BLOCKED</code>.</td></tr>
+  <tr><td><code>tests/test_predictive_optimization.py</code></td><td><span class="tag t-new">NEW</span></td>
+      <td>Unit tests: flag parsing (enable/disable/inherit/missing/error), parallel
+      <code>check_selections</code>, and <code>InventoryManager</code> integration.</td></tr>
+</table>
+
+<h2>8. New status lifecycle</h2>
+<p><code>PO_BLOCKED</code> is <b>terminal</b>. A blocked table is never queued, never chunked, never dispatched, and
+never auto-retried. To migrate it, an operator disables PO on the source (table/schema/catalog) and
+re-runs inventory; the table is then re-evaluated and queued normally.</p>
+
+<div class="callout warn"><b>Operational note (unchanged by this feature):</b> the per-chunk worker timeout and
+orchestrator run timeout were separately raised to <b>7 days</b>. The stale-record reconcile threshold
+(<code>stale_threshold_minutes = 120</code>) remains far below that window and should be revisited to avoid
+re-dispatching long-running chunks — tracked separately from the PO gate.</div>
+
+<p class="foot">Deep Clone Cross-Region Migration Orchestrator — Predictive Optimization Inventory Gate design specification.</p>
+</body></html>
